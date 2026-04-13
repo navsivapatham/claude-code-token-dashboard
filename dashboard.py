@@ -505,6 +505,7 @@ def compute_dashboard_data(sessions, config=None):
         config = {}
     now = datetime.now().astimezone()
     today = now.date()
+    start_of_week = today - timedelta(days=today.weekday())  # Monday
 
     sorted_sessions_list = sorted(
         sessions.items(),
@@ -542,7 +543,7 @@ def compute_dashboard_data(sessions, config=None):
             session_costs[sid] += ec
             if model:
                 model_period_costs[model]["all_time"] += ec
-                if (today - day).days < 7:
+                if day >= start_of_week:
                     model_period_costs[model]["week"] += ec
                 if day == today:
                     model_period_costs[model]["today"] += ec
@@ -669,8 +670,11 @@ def compute_dashboard_data(sessions, config=None):
             "today_output": td["output_tokens"],
             "today_cache": td["cache_creation_input_tokens"],
             "today_cost": round(today_cost, 4),
-            "week_total": sum(d["total"] for d in chart),
-            "week_cost": round(sum(d["cost"] for d in chart), 4),
+            "week_total": sum(
+                (daily[d]["input_tokens"] + daily[d]["output_tokens"] + daily[d]["cache_creation_input_tokens"])
+                for d in daily if d >= start_of_week
+            ),
+            "week_cost": round(sum(daily[d]["cost"] for d in daily if d >= start_of_week), 4),
             "all_time_total": all_time_total,
             "all_time_cost": round(all_time_cost, 4),
             "session_count": sum(1 for _, s in sorted_sessions_list if _agent_visible(s["agent"], config)),
@@ -715,6 +719,8 @@ _HTML_TEMPLATE = '''<!DOCTYPE html>
         --bg-primary: #0a0a0f;
         --bg-card: #12121a;
         --bg-card-hover: #16161f;
+        --bg-panel: #0e0e16;
+        --bg-tooltip: #16161f;
         --border: #1e1e2e;
         --border-subtle: #161622;
         --text-primary: #e8e8f0;
@@ -724,6 +730,22 @@ _HTML_TEMPLATE = '''<!DOCTYPE html>
         --accent-glow: rgba(108, 155, 255, 0.15);
         --gradient-start: #6c9bff;
         --gradient-end: #a855f7;
+        --tab-active-bg: var(--bg-card-hover);
+        --shadow-hover: 0 8px 28px rgba(108, 155, 255, 0.14);
+    }
+    [data-theme="light"] {
+        --bg-primary: #f5f5f7;
+        --bg-card: #ffffff;
+        --bg-card-hover: #f2f2f7;
+        --bg-panel: #ffffff;
+        --bg-tooltip: #ffffff;
+        --border: #d1d1d6;
+        --border-subtle: #e5e5ea;
+        --text-primary: #1c1c1e;
+        --text-secondary: #636366;
+        --text-dim: #aeaeb2;
+        --tab-active-bg: #d1d1d6;
+        --shadow-hover: 0 8px 28px rgba(0, 0, 0, 0.12);
     }
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
@@ -792,6 +814,18 @@ _HTML_TEMPLATE = '''<!DOCTYPE html>
         margin-left: auto;
     }
     .settings-btn:hover { border-color: var(--accent); color: var(--accent); }
+    .theme-btn {
+        background: none;
+        border: 1px solid var(--border);
+        color: var(--text-secondary);
+        border-radius: 6px;
+        padding: 2px 7px;
+        font-size: 0.82rem;
+        cursor: pointer;
+        transition: border-color 0.15s, color 0.15s;
+        line-height: 1.6;
+    }
+    .theme-btn:hover { border-color: var(--accent); color: var(--accent); }
 
     /* Settings panel */
     .settings-overlay {
@@ -804,7 +838,7 @@ _HTML_TEMPLATE = '''<!DOCTYPE html>
         position: fixed;
         top: 0; right: 0; bottom: 0;
         width: 380px;
-        background: #0e0e16;
+        background: var(--bg-panel);
         border-left: 1px solid var(--border);
         z-index: 101;
         display: flex;
@@ -973,9 +1007,13 @@ _HTML_TEMPLATE = '''<!DOCTYPE html>
         border: 1px solid var(--border);
         border-radius: 12px;
         padding: 20px;
-        transition: border-color 0.2s;
+        transition: border-color 0.22s ease, transform 0.22s cubic-bezier(0.34, 1.56, 0.64, 1), box-shadow 0.22s ease;
     }
-    .stat-card:hover { border-color: var(--accent); }
+    .stat-card:hover {
+        border-color: var(--accent);
+        transform: translateY(-3px);
+        box-shadow: var(--shadow-hover);
+    }
     .stat-card-head {
         display: flex;
         align-items: flex-start;
@@ -1040,7 +1078,7 @@ _HTML_TEMPLATE = '''<!DOCTYPE html>
         transition: background 0.15s, color 0.15s;
         letter-spacing: 0.04em;
     }
-    .tab-btn.active { background: var(--bg-card-hover); color: var(--text-primary); }
+    .tab-btn.active { background: var(--tab-active-bg); color: var(--text-primary); }
     .tab-btn:hover:not(.active) { color: var(--text-primary); }
     .line-chart-wrap { position: relative; }
     .line-empty {
@@ -1062,7 +1100,7 @@ _HTML_TEMPLATE = '''<!DOCTYPE html>
     /* Line tooltip */
     .line-tooltip {
         position: absolute;
-        background: #16161f;
+        background: var(--bg-tooltip);
         border: 1px solid var(--border);
         border-radius: 10px;
         padding: 10px 13px;
@@ -1124,7 +1162,7 @@ _HTML_TEMPLATE = '''<!DOCTYPE html>
     .bar-value {
         font-size: 0.6rem;
         color: var(--text-dim);
-        margin-bottom: 6px;
+        margin-bottom: 2px;
         font-family: 'SF Mono', 'Fira Code', monospace;
         min-height: 14px;
     }
@@ -1141,6 +1179,7 @@ _HTML_TEMPLATE = '''<!DOCTYPE html>
     .bar-group:hover .bar { opacity: 0.8; }
     .bar-day { font-size: 0.7rem; color: var(--text-secondary); margin-top: 8px; font-weight: 500; }
     .bar-date { font-size: 0.65rem; color: var(--text-dim); }
+    .bar-cost { font-size: 0.6rem; font-weight: 600; color: #7ee8a0; font-family: 'SF Mono', 'Fira Code', monospace; min-height: 13px; margin-bottom: 6px; }
 
     /* Agent/Model Breakdown */
     .agent-row {
@@ -1222,7 +1261,8 @@ _HTML_TEMPLATE = '''<!DOCTYPE html>
     }
     .health-grid {
         display: grid;
-        grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+        justify-content: center;
         gap: 12px;
         margin-top: 4px;
     }
@@ -1234,9 +1274,13 @@ _HTML_TEMPLATE = '''<!DOCTYPE html>
         display: flex;
         flex-direction: column;
         gap: 8px;
-        transition: border-color 0.2s;
+        transition: border-color 0.22s ease, transform 0.22s cubic-bezier(0.34, 1.56, 0.64, 1), box-shadow 0.22s ease;
     }
-    .health-agent:hover { border-color: var(--border); }
+    .health-agent:hover {
+        border-color: var(--accent);
+        transform: translateY(-2px);
+        box-shadow: var(--shadow-hover);
+    }
     .health-agent-head {
         display: flex;
         align-items: center;
@@ -1356,6 +1400,7 @@ _HTML_TEMPLATE = '''<!DOCTYPE html>
             <button v-if="serveMode" @click="refresh" class="refresh-btn" :disabled="refreshing">
                 {{ refreshing ? '\u2026' : '\u21bb' }}
             </button>
+            <button @click="toggleTheme" class="theme-btn" :title="darkMode ? 'Switch to light mode' : 'Switch to dark mode'">{{ darkMode ? '\u2600\ufe0f' : '\U0001F319' }}</button>
             <button @click="openSettings" class="settings-btn" title="Settings">\u2699</button>
         </div>
     </div>
@@ -1426,7 +1471,7 @@ _HTML_TEMPLATE = '''<!DOCTYPE html>
                 <div class="stat-cost-badge">{{ fmtCost(stats.week_cost) }}</div>
             </div>
             <div class="stat-value">{{ fmt(stats.week_total) }}</div>
-            <div class="stat-detail">Last 7 days</div>
+            <div class="stat-detail">Mon – today</div>
             <div class="stat-model-costs" v-if="stats.model_costs_week && stats.model_costs_week.length">
                 <div class="model-cost-row" v-for="mc in stats.model_costs_week" :key="mc.name">
                     <span class="model-cost-dot" :style="{ background: mc.color }"></span>
@@ -1535,8 +1580,8 @@ _HTML_TEMPLATE = '''<!DOCTYPE html>
                             :cx="hoverVBX" :cy="getHoverY(s.key)"
                             r="5" :fill="s.color" stroke="#0a0a0f" stroke-width="2" />
                     <text v-for="lbl in lineXLabels" :key="lbl.x"
-                          :x="lbl.x" y="164" fill="#3a3a4a" font-size="22"
-                          text-anchor="middle" font-family="'SF Mono','Fira Code',monospace">{{ lbl.text }}</text>
+                          :x="lbl.x" y="164" fill="#3a3a4a" font-size="16"
+                          :text-anchor="lbl.anchor" font-family="'SF Mono','Fira Code',monospace">{{ lbl.text }}</text>
                 </svg>
                 <div class="line-tooltip" :style="tooltipStyle" v-if="hoverIdx !== null">
                     <div class="tt-time">{{ hoverBucket && hoverBucket.ts }}</div>
@@ -1583,6 +1628,7 @@ _HTML_TEMPLATE = '''<!DOCTYPE html>
             <div class="chart">
                 <div class="bar-group" v-for="day in chart" :key="day.label">
                     <div class="bar-value">{{ fmt(day.total) }}</div>
+                    <div class="bar-cost">{{ day.cost > 0 ? fmtCost(day.cost) : '' }}</div>
                     <div class="bar-track">
                         <div class="bar" :class="{ 'bar-today': day.is_today }" :style="{ height: day.bar_pct + '%' }"></div>
                     </div>
@@ -1666,6 +1712,7 @@ Vue.createApp({
             healthNow: Date.now(),
             settingsOpen: false,
             agentDraft: [],
+            darkMode: true,
         };
     },
 
@@ -1717,11 +1764,12 @@ Vue.createApp({
             const buckets = this.line.buckets;
             const n = buckets.length;
             const W = 1000;
-            const step = 12; // one label per hour (12 × 5min)
+            const step = 6; // one label per 30 min (6 × 5min)
             const labels = [];
             for (let i = 0; i < n; i += step) {
                 const x = n > 1 ? (i / (n - 1)) * W : W / 2;
-                labels.push({ x: x.toFixed(1), text: buckets[i].ts });
+                const anchor = i === 0 ? 'start' : (i + step >= n ? 'end' : 'middle');
+                labels.push({ x: x.toFixed(1), text: buckets[i].ts, anchor });
             }
             return labels;
         },
@@ -1819,6 +1867,11 @@ Vue.createApp({
             const a = this.all_agents.find(x => x.name === raw);
             return (a && a.display_name) ? a.display_name : raw;
         },
+        toggleTheme() {
+            this.darkMode = !this.darkMode;
+            document.documentElement.setAttribute('data-theme', this.darkMode ? 'dark' : 'light');
+            localStorage.setItem('dashboard-theme', this.darkMode ? 'dark' : 'light');
+        },
         openSettings() {
             this.agentDraft = JSON.parse(JSON.stringify(this.all_agents || []));
             this.settingsOpen = true;
@@ -1900,6 +1953,9 @@ Vue.createApp({
     },
 
     mounted() {
+        const savedTheme = localStorage.getItem('dashboard-theme') || 'dark';
+        this.darkMode = savedTheme !== 'light';
+        document.documentElement.setAttribute('data-theme', savedTheme);
         setInterval(() => { this.healthNow = Date.now(); }, 1000);
         if (SERVE_MODE) {
             setInterval(this.refreshHealth, 5 * 1000);
