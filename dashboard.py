@@ -353,7 +353,7 @@ def _get_last_context_usage(filepath):
     return None
 
 
-def collect_agent_health():
+def collect_agent_health(config=None):
     """Return a list of agent health records from tmux sessions and JSONL activity."""
     now = datetime.now().astimezone()
 
@@ -390,8 +390,11 @@ def collect_agent_health():
         except OSError:
             pass
 
-    # --- Merge: all known agents from either source ---
-    all_names = sorted(set(tmux_sessions) | set(agent_last_activity))
+    # --- Merge: all known agents from either source, filtered by config ---
+    all_names = sorted(
+        n for n in set(tmux_sessions) | set(agent_last_activity)
+        if _agent_visible(n, config)
+    )
 
     records = []
     for name in all_names:
@@ -691,7 +694,7 @@ def compute_dashboard_data(sessions, config=None):
         "updated": now.strftime("%b %d, %Y at %H:%M"),
         "agent_colors": agent_colors,
         "line": compute_line_data(sessions, config=config),
-        "agent_health": collect_agent_health(),
+        "agent_health": collect_agent_health(config=config),
         "all_agents": build_all_agents(config),
         "config_file": CONFIG_FILE,
     }
@@ -1949,7 +1952,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         elif self.path == "/api/health":
             payload = json.dumps({
-                "agents": collect_agent_health(),
+                "agents": collect_agent_health(config=load_config()),
                 "server_time": datetime.now().timestamp(),
             }).encode("utf-8")
             self.send_response(200)
