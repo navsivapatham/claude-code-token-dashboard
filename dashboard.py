@@ -1388,6 +1388,7 @@ _HTML_TEMPLATE = '''<!DOCTYPE html>
         .health-grid { grid-template-columns: 1fr 1fr; }
     }
 </style>
+<script>(function(){const p=new URLSearchParams(location.search);const t=p.get('theme');if(t==='light'||t==='dark')document.documentElement.setAttribute('data-theme',t);})()</script>
 </head>
 <body>
 <div id="app" class="container">
@@ -1953,7 +1954,8 @@ Vue.createApp({
     },
 
     mounted() {
-        const savedTheme = localStorage.getItem('dashboard-theme') || 'dark';
+        const urlTheme = new URLSearchParams(location.search).get('theme');
+        const savedTheme = urlTheme || localStorage.getItem('dashboard-theme') || 'dark';
         this.darkMode = savedTheme !== 'light';
         document.documentElement.setAttribute('data-theme', savedTheme);
         setInterval(() => { this.healthNow = Date.now(); }, 1000);
@@ -1985,7 +1987,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
     """HTTP handler serving the live dashboard and a JSON data API."""
 
     def do_GET(self):
-        if self.path in ("/", "/index.html"):
+        if self.path.split("?")[0] in ("/", "/index.html"):
             config = load_config()
             sessions = collect_all_data()
             data = compute_dashboard_data(sessions, config=config)

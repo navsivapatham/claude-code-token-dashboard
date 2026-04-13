@@ -2,7 +2,12 @@
 
 A local dashboard that parses your Claude Code session transcripts and shows token usage statistics. No cloud, no API keys — reads the JSONL files Claude Code already writes to your machine.
 
-![Dashboard Screenshot](screenshot.png)
+<table>
+  <tr>
+    <td><img src="screenshots/light.png" alt="Light mode" /></td>
+    <td><img src="screenshots/dark-settings.png" alt="Dark mode with settings" /></td>
+  </tr>
+</table>
 
 ## Features
 
@@ -12,6 +17,9 @@ A local dashboard that parses your Claude Code session transcripts and shows tok
 - **Per-agent breakdown** — today's usage split by agent/project
 - **Usage by model** — all-time token breakdown across Opus, Sonnet, and Haiku
 - **Session-level detail** — input, output, cache write, and cache read tokens per session
+- **Agent Health Monitor** — tmux session status, last-active counter, and context window usage per agent
+- **Settings panel** — toggle agent visibility, set display names; changes apply instantly in server mode
+- **Light / dark mode** — toggle with one click, preference saved to localStorage
 - **Reactive live server** — Vue 3 powered, polls `/api/data` every 5 minutes and updates in place without a page reload
 - **Zero Python dependencies** — standard library only, no pip installs
 
