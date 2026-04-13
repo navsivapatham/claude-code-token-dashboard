@@ -177,6 +177,38 @@ def _model_short(name):
 
 
 # ---------------------------------------------------------------------------
+# Pricing
+# ---------------------------------------------------------------------------
+
+# Per-million-token prices (USD). Cache read = 10% of input; cache write = 125% of input.
+MODEL_PRICING = {
+    "opus-4-6":   {"input": 15.00, "output": 75.00},
+    "sonnet-4-6": {"input": 3.00,  "output": 15.00},
+    "haiku-4-5":  {"input": 0.80,  "output": 4.00},
+}
+
+
+def _get_pricing(model):
+    for key, pricing in MODEL_PRICING.items():
+        if key in model:
+            return pricing
+    return None
+
+
+def _entry_cost(model, input_t, output_t, cache_read_t, cache_write_t):
+    """Estimate USD cost for a single API response."""
+    p = _get_pricing(model)
+    if not p:
+        return 0.0
+    return (
+        (input_t      / 1_000_000) * p["input"] +
+        (output_t     / 1_000_000) * p["output"] +
+        (cache_read_t / 1_000_000) * p["input"] * 0.10 +
+        (cache_write_t/ 1_000_000) * p["input"] * 1.25
+    )
+
+
+# ---------------------------------------------------------------------------
 # Line graph data (last N hours, 5-min buckets)
 # ---------------------------------------------------------------------------
 
@@ -188,6 +220,8 @@ def compute_line_data(sessions, hours=5, bucket_minutes=5):
 
     buckets_model = [defaultdict(int) for _ in range(n_buckets)]
     buckets_agent = [defaultdict(int) for _ in range(n_buckets)]
+    buckets_model_cost = [defaultdict(float) for _ in range(n_buckets)]
+    buckets_agent_cost = [defaultdict(float) for _ in range(n_buckets)]
     bucket_labels = []
     for i in range(n_buckets):
         t = cutoff + timedelta(minutes=i * bucket_minutes)
@@ -211,8 +245,12 @@ def compute_line_data(sessions, hours=5, bucket_minutes=5):
             model = entry.get("model", "unknown")
             agent = entry.get("agent", s["agent"])
             total = entry["input_tokens"] + entry["output_tokens"] + entry["cache_creation_input_tokens"]
+            ec = _entry_cost(model, entry["input_tokens"], entry["output_tokens"],
+                             entry["cache_read_input_tokens"], entry["cache_creation_input_tokens"])
             buckets_model[idx][model] += total
             buckets_agent[idx][agent] += total
+            buckets_model_cost[idx][model] += ec
+            buckets_agent_cost[idx][agent] += ec
             all_models.add(model)
             all_agents.add(agent)
 
@@ -222,6 +260,8 @@ def compute_line_data(sessions, hours=5, bucket_minutes=5):
             "ts": bucket_labels[i],
             "by_model": dict(buckets_model[i]),
             "by_agent": dict(buckets_agent[i]),
+            "cost_by_model": {k: round(v, 6) for k, v in buckets_model_cost[i].items()},
+            "cost_by_agent": {k: round(v, 6) for k, v in buckets_agent_cost[i].items()},
         })
 
     return {
@@ -247,8 +287,10 @@ def compute_dashboard_data(sessions):
     )
 
     token_keys = ["input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens", "output_tokens"]
-    daily = defaultdict(lambda: dict.fromkeys(token_keys, 0))
-    agent_today = defaultdict(lambda: dict.fromkeys(token_keys, 0))
+    daily = defaultdict(lambda: {**dict.fromkeys(token_keys, 0), "cost": 0.0})
+    agent_today = defaultdict(lambda: {**dict.fromkeys(token_keys, 0), "cost": 0.0})
+    session_costs = defaultdict(float)
+    model_period_costs = defaultdict(lambda: {"today": 0.0, "week": 0.0, "all_time": 0.0})
 
     for sid, s in sorted_sessions_list:
         for entry in s.get("entries", []):
@@ -256,34 +298,60 @@ def compute_dashboard_data(sessions):
             if et is None:
                 continue
             day = et.astimezone().date()
+            model = entry.get("model", "")
             for k in token_keys:
                 daily[day][k] += entry[k]
+            ec = _entry_cost(
+                model,
+                entry["input_tokens"],
+                entry["output_tokens"],
+                entry["cache_read_input_tokens"],
+                entry["cache_creation_input_tokens"],
+            )
+            daily[day]["cost"] += ec
+            session_costs[sid] += ec
+            if model:
+                model_period_costs[model]["all_time"] += ec
+                if (today - day).days < 7:
+                    model_period_costs[model]["week"] += ec
+                if day == today:
+                    model_period_costs[model]["today"] += ec
             if day == today:
                 agent = entry.get("agent", s["agent"])
                 for k in token_keys:
                     agent_today[agent][k] += entry[k]
+                agent_today[agent]["cost"] += ec
 
     # Chart — last 7 days
     chart = []
     for i in range(6, -1, -1):
         d = today - timedelta(days=i)
-        t = daily.get(d, dict.fromkeys(token_keys, 0))
+        t = daily.get(d, {**dict.fromkeys(token_keys, 0), "cost": 0.0})
         total = t["input_tokens"] + t["output_tokens"] + t["cache_creation_input_tokens"]
-        chart.append({"label": d.strftime("%a"), "date_num": d.strftime("%d"), "total": total, "is_today": d == today})
+        chart.append({
+            "label": d.strftime("%a"),
+            "date_num": d.strftime("%d"),
+            "total": total,
+            "cost": round(t["cost"], 4),
+            "is_today": d == today,
+        })
 
     max_daily = max((d["total"] for d in chart), default=1) or 1
     for d in chart:
         d["bar_pct"] = max(round((d["total"] / max_daily) * 100, 1), 2)
 
     # Today stats
-    td = daily.get(today, dict.fromkeys(token_keys, 0))
+    td = daily.get(today, {**dict.fromkeys(token_keys, 0), "cost": 0.0})
     today_total = td["input_tokens"] + td["output_tokens"] + td["cache_creation_input_tokens"]
+    today_cost = td["cost"]
 
     # All-time
     all_time = dict.fromkeys(token_keys, 0)
+    all_time_cost = 0.0
     for dv in daily.values():
         for k in token_keys:
             all_time[k] += dv[k]
+        all_time_cost += dv.get("cost", 0.0)
     all_time_total = all_time["input_tokens"] + all_time["output_tokens"] + all_time["cache_creation_input_tokens"]
 
     # Agent colors
@@ -293,11 +361,12 @@ def compute_dashboard_data(sessions):
     # Agents today
     agents_today_data = []
     for agent in all_agents:
-        a = agent_today.get(agent, dict.fromkeys(token_keys, 0))
+        a = agent_today.get(agent, {**dict.fromkeys(token_keys, 0), "cost": 0.0})
         total = a["input_tokens"] + a["output_tokens"] + a["cache_creation_input_tokens"]
         agents_today_data.append({
             "name": agent,
             "total": total,
+            "cost": round(a["cost"], 4),
             "bar_pct": round(min((total / max(today_total, 1)) * 100, 100), 1),
             "color": agent_colors.get(agent, "#8a8a9a"),
         })
@@ -329,6 +398,7 @@ def compute_dashboard_data(sessions):
             "name": model_name,
             "short": _model_short(model_name),
             "total": total,
+            "cost": round(model_period_costs[model_name]["all_time"], 4),
             "bar_pct": round(min((total / max_model) * 100, 100), 1),
             "color": _model_color(model_name),
         })
@@ -354,6 +424,7 @@ def compute_dashboard_data(sessions):
             "cache_write": s["cache_creation_input_tokens"],
             "cache_read": s["cache_read_input_tokens"],
             "total": total,
+            "cost": round(session_costs.get(sid, 0.0), 4),
             "is_today": day == today if day else False,
         })
 
@@ -363,9 +434,24 @@ def compute_dashboard_data(sessions):
             "today_input": td["input_tokens"],
             "today_output": td["output_tokens"],
             "today_cache": td["cache_creation_input_tokens"],
+            "today_cost": round(today_cost, 4),
             "week_total": sum(d["total"] for d in chart),
+            "week_cost": round(sum(d["cost"] for d in chart), 4),
             "all_time_total": all_time_total,
+            "all_time_cost": round(all_time_cost, 4),
             "session_count": len(sorted_sessions_list),
+            "model_costs_today": sorted(
+                [{"name": m, "short": _model_short(m), "color": _model_color(m), "cost": round(v["today"], 4)}
+                 for m, v in model_period_costs.items() if v["today"] > 0],
+                key=lambda x: x["cost"], reverse=True),
+            "model_costs_week": sorted(
+                [{"name": m, "short": _model_short(m), "color": _model_color(m), "cost": round(v["week"], 4)}
+                 for m, v in model_period_costs.items() if v["week"] > 0],
+                key=lambda x: x["cost"], reverse=True),
+            "model_costs_all_time": sorted(
+                [{"name": m, "short": _model_short(m), "color": _model_color(m), "cost": round(v["all_time"], 4)}
+                 for m, v in model_period_costs.items() if v["all_time"] > 0],
+                key=lambda x: x["cost"], reverse=True),
         },
         "chart": chart,
         "agents_today": agents_today_data,
@@ -472,13 +558,29 @@ _HTML_TEMPLATE = '''<!DOCTYPE html>
         transition: border-color 0.2s;
     }
     .stat-card:hover { border-color: var(--accent); }
+    .stat-card-head {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        margin-bottom: 8px;
+    }
     .stat-label {
         color: var(--text-secondary);
         font-size: 0.7rem;
         font-weight: 600;
         text-transform: uppercase;
         letter-spacing: 0.08em;
-        margin-bottom: 8px;
+    }
+    .stat-cost-badge {
+        font-size: 0.7rem;
+        font-weight: 700;
+        color: #7ee8a0;
+        background: rgba(126, 232, 160, 0.1);
+        border: 1px solid rgba(126, 232, 160, 0.2);
+        border-radius: 5px;
+        padding: 2px 8px;
+        letter-spacing: 0.01em;
+        white-space: nowrap;
     }
     .stat-value {
         font-size: 2rem;
@@ -486,8 +588,13 @@ _HTML_TEMPLATE = '''<!DOCTYPE html>
         color: var(--text-primary);
         letter-spacing: -0.02em;
     }
-    .stat-detail { color: var(--text-secondary); font-size: 0.72rem; margin-top: 6px; }
+    .stat-detail { color: var(--text-secondary); font-size: 0.72rem; margin-top: 4px; }
     .stat-detail span { margin-right: 12px; }
+    .stat-model-costs { margin-top: 12px; border-top: 1px solid var(--border-subtle); padding-top: 10px; display: flex; flex-direction: column; gap: 5px; }
+    .model-cost-row { display: flex; align-items: center; gap: 6px; }
+    .model-cost-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+    .model-cost-name { font-size: 0.68rem; color: var(--text-secondary); flex: 1; }
+    .model-cost-val { font-size: 0.68rem; font-weight: 700; font-family: 'SF Mono', 'Fira Code', monospace; color: #7ee8a0; }
 
     .line-card-header {
         display: flex;
@@ -563,6 +670,13 @@ _HTML_TEMPLATE = '''<!DOCTYPE html>
         font-family: 'SF Mono', 'Fira Code', monospace;
         color: var(--text-primary);
     }
+    .tt-cost {
+        font-size: 0.65rem;
+        font-weight: 600;
+        font-family: 'SF Mono', 'Fira Code', monospace;
+        color: #7ee8a0;
+        margin-left: 4px;
+    }
 
     /* Main Grid */
     .main-grid {
@@ -621,13 +735,20 @@ _HTML_TEMPLATE = '''<!DOCTYPE html>
     .agent-row:last-child { border-bottom: none; }
     .agent-bar-wrap { flex: 1; height: 6px; background: var(--border-subtle); border-radius: 3px; overflow: hidden; }
     .agent-bar { height: 100%; border-radius: 3px; transition: width 0.4s ease; }
+    .agent-total-wrap { display: flex; flex-direction: column; align-items: flex-end; min-width: 80px; }
     .agent-total {
         font-weight: 700;
         color: var(--text-primary);
         font-size: 0.85rem;
-        min-width: 80px;
         text-align: right;
         font-family: 'SF Mono', 'Fira Code', monospace;
+    }
+    .agent-cost {
+        font-size: 0.65rem;
+        font-weight: 600;
+        color: #7ee8a0;
+        font-family: 'SF Mono', 'Fira Code', monospace;
+        text-align: right;
     }
     .dim { color: var(--text-dim); font-weight: 400; }
     .badge {
@@ -671,6 +792,7 @@ _HTML_TEMPLATE = '''<!DOCTYPE html>
     .mono { font-family: 'SF Mono', 'Fira Code', monospace; font-size: 0.73rem; color: var(--text-secondary); }
     .num { text-align: right; font-family: 'SF Mono', 'Fira Code', monospace; font-size: 0.73rem; }
     .bold { font-weight: 700; color: var(--text-primary); }
+    .cost-cell { color: #7ee8a0; font-weight: 600; }
 
     @media (max-width: 768px) {
         .stats-grid { grid-template-columns: 1fr; }
@@ -695,23 +817,53 @@ _HTML_TEMPLATE = '''<!DOCTYPE html>
 
     <div class="stats-grid">
         <div class="stat-card">
-            <div class="stat-label">Today</div>
+            <div class="stat-card-head">
+                <div class="stat-label">Today</div>
+                <div class="stat-cost-badge">{{ fmtCost(stats.today_cost) }}</div>
+            </div>
             <div class="stat-value">{{ fmt(stats.today_total) }}</div>
             <div class="stat-detail">
                 <span>In: {{ fmt(stats.today_input) }}</span>
                 <span>Out: {{ fmt(stats.today_output) }}</span>
                 <span>Cache: {{ fmt(stats.today_cache) }}</span>
             </div>
+            <div class="stat-model-costs" v-if="stats.model_costs_today && stats.model_costs_today.length">
+                <div class="model-cost-row" v-for="mc in stats.model_costs_today" :key="mc.name">
+                    <span class="model-cost-dot" :style="{ background: mc.color }"></span>
+                    <span class="model-cost-name">{{ mc.short }}</span>
+                    <span class="model-cost-val">{{ fmtCost(mc.cost) }}</span>
+                </div>
+            </div>
         </div>
         <div class="stat-card">
-            <div class="stat-label">This Week</div>
+            <div class="stat-card-head">
+                <div class="stat-label">This Week</div>
+                <div class="stat-cost-badge">{{ fmtCost(stats.week_cost) }}</div>
+            </div>
             <div class="stat-value">{{ fmt(stats.week_total) }}</div>
             <div class="stat-detail">Last 7 days</div>
+            <div class="stat-model-costs" v-if="stats.model_costs_week && stats.model_costs_week.length">
+                <div class="model-cost-row" v-for="mc in stats.model_costs_week" :key="mc.name">
+                    <span class="model-cost-dot" :style="{ background: mc.color }"></span>
+                    <span class="model-cost-name">{{ mc.short }}</span>
+                    <span class="model-cost-val">{{ fmtCost(mc.cost) }}</span>
+                </div>
+            </div>
         </div>
         <div class="stat-card">
-            <div class="stat-label">All Time</div>
+            <div class="stat-card-head">
+                <div class="stat-label">All Time</div>
+                <div class="stat-cost-badge">{{ fmtCost(stats.all_time_cost) }}</div>
+            </div>
             <div class="stat-value">{{ fmt(stats.all_time_total) }}</div>
             <div class="stat-detail">{{ stats.session_count }} sessions</div>
+            <div class="stat-model-costs" v-if="stats.model_costs_all_time && stats.model_costs_all_time.length">
+                <div class="model-cost-row" v-for="mc in stats.model_costs_all_time" :key="mc.name">
+                    <span class="model-cost-dot" :style="{ background: mc.color }"></span>
+                    <span class="model-cost-name">{{ mc.short }}</span>
+                    <span class="model-cost-val">{{ fmtCost(mc.cost) }}</span>
+                </div>
+            </div>
         </div>
     </div>
 
@@ -759,6 +911,7 @@ _HTML_TEMPLATE = '''<!DOCTYPE html>
                         <span class="tt-dot" :style="{ background: v.color }"></span>
                         <span class="tt-label">{{ v.label }}</span>
                         <span class="tt-value">{{ fmt(v.value) }}</span>
+                        <span class="tt-cost" v-if="v.cost > 0">{{ fmtCost(v.cost) }}</span>
                     </div>
                 </div>
                 <div class="line-legend">
@@ -780,10 +933,13 @@ _HTML_TEMPLATE = '''<!DOCTYPE html>
                     <div class="agent-bar-wrap">
                         <div class="agent-bar" :style="{ width: agent.bar_pct + '%', background: agent.color + '40' }"></div>
                     </div>
-                    <span class="agent-total">{{ fmt(agent.total) }}</span>
+                    <div class="agent-total-wrap">
+                        <span class="agent-total">{{ fmt(agent.total) }}</span>
+                        <span class="agent-cost" v-if="agent.cost > 0">{{ fmtCost(agent.cost) }}</span>
+                    </div>
                 </template>
                 <template v-else>
-                    <span class="agent-total dim">\u2014</span>
+                    <div class="agent-total-wrap"><span class="agent-total dim">\u2014</span></div>
                 </template>
             </div>
         </div>
@@ -812,7 +968,10 @@ _HTML_TEMPLATE = '''<!DOCTYPE html>
                 <div class="agent-bar-wrap">
                     <div class="agent-bar" :style="{ width: model.bar_pct + '%', background: model.color + '40' }"></div>
                 </div>
-                <span class="agent-total">{{ fmt(model.total) }}</span>
+                <div class="agent-total-wrap">
+                    <span class="agent-total">{{ fmt(model.total) }}</span>
+                    <span class="agent-cost" v-if="model.cost > 0">{{ fmtCost(model.cost) }}</span>
+                </div>
             </div>
         </div>
 
@@ -836,6 +995,7 @@ _HTML_TEMPLATE = '''<!DOCTYPE html>
                         <th style="text-align:right">Cache Write</th>
                         <th style="text-align:right">Cache Read</th>
                         <th style="text-align:right">Total</th>
+                        <th style="text-align:right">Est. Cost</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -849,6 +1009,7 @@ _HTML_TEMPLATE = '''<!DOCTYPE html>
                         <td class="num">{{ fmt(session.cache_write) }}</td>
                         <td class="num">{{ fmt(session.cache_read) }}</td>
                         <td class="num bold">{{ fmt(session.total) }}</td>
+                        <td class="num cost-cell">{{ fmtCost(session.cost) }}</td>
                     </tr>
                 </tbody>
             </table>
@@ -946,7 +1107,8 @@ Vue.createApp({
             const tab = this.lineTab;
             return this.linePaths.map(s => {
                 const src = tab === 'model' ? b.by_model : b.by_agent;
-                return { label: s.label, color: s.color, value: src[s.key] || 0 };
+                const costSrc = tab === 'model' ? b.cost_by_model : b.cost_by_agent;
+                return { label: s.label, color: s.color, value: src[s.key] || 0, cost: (costSrc && costSrc[s.key]) || 0 };
             });
         },
 
@@ -969,6 +1131,11 @@ Vue.createApp({
     methods: {
         fmt(n) {
             return (n || 0).toLocaleString();
+        },
+        fmtCost(n) {
+            if (!n || n < 0.01) return '< $0.01';
+            if (n < 1000) return '$' + n.toFixed(2);
+            return '$' + n.toLocaleString('en', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
         },
         badgeStyle(color) {
             return { background: color + '18', color };
