@@ -516,10 +516,11 @@ def compute_dashboard_data(sessions, config=None):
     model_period_costs = defaultdict(lambda: {"today": 0.0, "week": 0.0, "all_time": 0.0})
 
     for sid, s in sorted_sessions_list:
-        session_agent = s["agent"]
-        if not _agent_visible(session_agent, config):
-            continue
         for entry in s.get("entries", []):
+            # Entry-level agent filter: hidden agents contribute nothing to any metric
+            entry_agent = entry.get("agent", s["agent"])
+            if not _agent_visible(entry_agent, config):
+                continue
             et = entry.get("parsed_timestamp") or s["first_timestamp"]
             if et is None:
                 continue
@@ -543,10 +544,9 @@ def compute_dashboard_data(sessions, config=None):
                 if day == today:
                     model_period_costs[model]["today"] += ec
             if day == today:
-                agent = entry.get("agent", session_agent)
                 for k in token_keys:
-                    agent_today[agent][k] += entry[k]
-                agent_today[agent]["cost"] += ec
+                    agent_today[entry_agent][k] += entry[k]
+                agent_today[entry_agent]["cost"] += ec
 
     # Chart — last 7 days
     chart = []
@@ -598,10 +598,12 @@ def compute_dashboard_data(sessions, config=None):
             "color": agent_colors.get(agent, "#8a8a9a"),
         })
 
-    # Models
+    # Models (entry-level filter — same rule as stat aggregation)
     model_totals = defaultdict(lambda: dict.fromkeys(["input_tokens", "output_tokens", "cache_creation_input_tokens"], 0))
     for sid, s in sorted_sessions_list:
         for entry in s.get("entries", []):
+            if not _agent_visible(entry.get("agent", s["agent"]), config):
+                continue
             m = entry.get("model", "")
             if m:
                 model_totals[m]["input_tokens"] += entry["input_tokens"]
@@ -668,7 +670,7 @@ def compute_dashboard_data(sessions, config=None):
             "week_cost": round(sum(d["cost"] for d in chart), 4),
             "all_time_total": all_time_total,
             "all_time_cost": round(all_time_cost, 4),
-            "session_count": len(sorted_sessions_list),
+            "session_count": sum(1 for _, s in sorted_sessions_list if _agent_visible(s["agent"], config)),
             "model_costs_today": sorted(
                 [{"name": m, "short": _model_short(m), "color": _model_color(m), "cost": round(v["today"], 4)}
                  for m, v in model_period_costs.items() if v["today"] > 0],
@@ -943,21 +945,12 @@ _HTML_TEMPLATE = '''<!DOCTYPE html>
         flex-direction: column;
         gap: 8px;
     }
-    .settings-save-btn {
-        background: var(--accent);
-        border: none;
-        border-radius: 8px;
-        color: #fff;
-        font-size: 0.78rem;
-        font-weight: 700;
-        padding: 9px 18px;
-        cursor: pointer;
-        width: 100%;
-        transition: opacity 0.15s;
+    .settings-autosave-hint {
+        font-size: 0.68rem;
+        color: var(--text-dim);
+        text-align: center;
         letter-spacing: 0.01em;
     }
-    .settings-save-btn:hover:not(:disabled) { opacity: 0.85; }
-    .settings-save-btn:disabled { opacity: 0.4; cursor: default; }
     .settings-config-path {
         font-size: 0.6rem;
         color: var(--text-dim);
@@ -1379,7 +1372,7 @@ _HTML_TEMPLATE = '''<!DOCTYPE html>
                      class="settings-agent-row" :class="{ 'hidden-agent': !a.visible }">
                     <label class="toggle-wrap">
                         <input class="toggle-input" type="checkbox" :checked="a.visible"
-                               @change="a.visible = $event.target.checked">
+                               @change="a.visible = $event.target.checked; autoSave(0)">
                         <span class="toggle-track"><span class="toggle-thumb"></span></span>
                     </label>
                     <div class="settings-agent-info">
@@ -1387,6 +1380,7 @@ _HTML_TEMPLATE = '''<!DOCTYPE html>
                         <input class="settings-name-input"
                                :placeholder="'Display name (default: ' + a.name + ')'"
                                v-model="a.display_name"
+                               @input="autoSave(800)"
                                :disabled="!a.visible">
                         <div class="settings-agent-paths" v-if="a.paths && a.paths.length">
                             <span v-for="p in a.paths" :key="p" class="settings-agent-path" :title="p">{{ p }}</span>
@@ -1396,9 +1390,9 @@ _HTML_TEMPLATE = '''<!DOCTYPE html>
             </div>
         </div>
         <div class="settings-footer">
-            <button class="settings-save-btn" @click="saveSettings" :disabled="savingSettings || !serveMode">
-                {{ !serveMode ? 'Save disabled in static mode' : savingSettings ? 'Saving\u2026' : 'Save Settings' }}
-            </button>
+            <div class="settings-autosave-hint">
+                {{ serveMode ? 'Changes apply instantly' : 'Live updates require server mode' }}
+            </div>
             <div class="settings-config-path">{{ configFile }}</div>
         </div>
     </div>
@@ -1669,7 +1663,6 @@ Vue.createApp({
             healthNow: Date.now(),
             settingsOpen: false,
             agentDraft: [],
-            savingSettings: false,
         };
     },
 
@@ -1830,28 +1823,25 @@ Vue.createApp({
         closeSettings() {
             this.settingsOpen = false;
         },
-        async saveSettings() {
-            if (this.savingSettings) return;
-            this.savingSettings = true;
-            try {
+        autoSave(delay) {
+            if (!this.serveMode) return;
+            if (this._saveTimer) clearTimeout(this._saveTimer);
+            this._saveTimer = setTimeout(async () => {
                 const agentsConfig = {};
                 for (const a of this.agentDraft) {
                     agentsConfig[a.name] = { visible: a.visible, display_name: a.display_name || '' };
                 }
-                const res = await fetch('/api/config', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ agents: agentsConfig }),
-                });
-                if (res.ok) {
-                    this.closeSettings();
-                    await this.refresh();
+                try {
+                    const res = await fetch('/api/config', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ agents: agentsConfig }),
+                    });
+                    if (res.ok) await this.refresh();
+                } catch (e) {
+                    console.warn('Auto-save failed:', e);
                 }
-            } catch (e) {
-                console.warn('Settings save failed:', e);
-            } finally {
-                this.savingSettings = false;
-            }
+            }, delay || 0);
         },
         ctxBarColor(pct) {
             if (pct < 60) return '#7ee8a0';
