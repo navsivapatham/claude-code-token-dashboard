@@ -15,6 +15,7 @@ import json
 import os
 import glob
 import argparse
+import subprocess
 import webbrowser
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
@@ -206,6 +207,110 @@ def _entry_cost(model, input_t, output_t, cache_read_t, cache_write_t):
         (cache_read_t / 1_000_000) * p["input"] * 0.10 +
         (cache_write_t/ 1_000_000) * p["input"] * 1.25
     )
+
+
+# ---------------------------------------------------------------------------
+# Agent health monitoring
+# ---------------------------------------------------------------------------
+
+IDLE_THRESHOLD_MINUTES = 10
+
+
+def _fmt_uptime(seconds):
+    """Format a duration in seconds to a human-readable uptime string."""
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        h, m = divmod(seconds, 3600)
+        return f"{h}h {m // 60}m"
+    d, rem = divmod(seconds, 86400)
+    return f"{d}d {rem // 3600}h"
+
+
+def _fmt_ago(dt, now):
+    """Format a datetime as 'Xs/Xm/Xh ago'."""
+    secs = int((now - dt).total_seconds())
+    if secs < 0:
+        return "just now"
+    if secs < 60:
+        return f"{secs}s ago"
+    if secs < 3600:
+        return f"{secs // 60}m ago"
+    if secs < 86400:
+        return f"{secs // 3600}h ago"
+    return f"{secs // 86400}d ago"
+
+
+def collect_agent_health():
+    """Return a list of agent health records from tmux sessions and JSONL activity."""
+    now = datetime.now().astimezone()
+
+    # --- tmux sessions ---
+    tmux_sessions = {}
+    try:
+        result = subprocess.run(
+            ["tmux", "list-sessions", "-F", "#{session_name}:#{session_created}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        for line in result.stdout.strip().splitlines():
+            if ":" in line:
+                name, epoch_str = line.split(":", 1)
+                try:
+                    created = datetime.fromtimestamp(int(epoch_str)).astimezone()
+                except (ValueError, OSError):
+                    created = None
+                tmux_sessions[name] = {"created": created}
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+
+    # --- Last activity per agent from JSONL mtime ---
+    agent_last_activity = {}
+    pattern = os.path.join(PROJECTS_DIR, "**", "*.jsonl")
+    for filepath in glob.glob(pattern, recursive=True):
+        agent = detect_agent(filepath)
+        if agent == "default":
+            continue
+        try:
+            mtime = datetime.fromtimestamp(os.path.getmtime(filepath)).astimezone()
+            if agent not in agent_last_activity or mtime > agent_last_activity[agent]:
+                agent_last_activity[agent] = mtime
+        except OSError:
+            pass
+
+    # --- Merge: all known agents from either source ---
+    all_names = sorted(set(tmux_sessions) | set(agent_last_activity))
+
+    records = []
+    for name in all_names:
+        last_activity = agent_last_activity.get(name)
+        tmux_info = tmux_sessions.get(name)
+
+        if tmux_info is None:
+            status = "offline"
+        elif last_activity is None:
+            status = "idle"
+        else:
+            minutes_since = (now - last_activity).total_seconds() / 60
+            status = "active" if minutes_since <= IDLE_THRESHOLD_MINUTES else "idle"
+
+        uptime = None
+        session_started = None
+        if tmux_info and tmux_info["created"]:
+            uptime = _fmt_uptime(int((now - tmux_info["created"]).total_seconds()))
+            session_started = tmux_info["created"].strftime("%H:%M")
+
+        records.append({
+            "name": name,
+            "status": status,
+            "last_activity": last_activity.strftime("%H:%M:%S") if last_activity else None,
+            "last_activity_ago": _fmt_ago(last_activity, now) if last_activity else None,
+            "uptime": uptime,
+            "session_started": session_started,
+        })
+
+    return records
 
 
 # ---------------------------------------------------------------------------
@@ -460,6 +565,7 @@ def compute_dashboard_data(sessions):
         "updated": now.strftime("%b %d, %Y at %H:%M"),
         "agent_colors": agent_colors,
         "line": compute_line_data(sessions),
+        "agent_health": collect_agent_health(),
     }
 
 
@@ -794,10 +900,108 @@ _HTML_TEMPLATE = '''<!DOCTYPE html>
     .bold { font-weight: 700; color: var(--text-primary); }
     .cost-cell { color: #7ee8a0; font-weight: 600; }
 
+    /* Agent Health Monitor */
+    .health-card {
+        background: var(--bg-card);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 20px;
+        margin-bottom: 24px;
+    }
+    .health-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+        gap: 12px;
+        margin-top: 4px;
+    }
+    .health-agent {
+        background: var(--bg-primary);
+        border: 1px solid var(--border-subtle);
+        border-radius: 10px;
+        padding: 14px 16px;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        transition: border-color 0.2s;
+    }
+    .health-agent:hover { border-color: var(--border); }
+    .health-agent-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+    }
+    .health-agent-name {
+        font-size: 0.82rem;
+        font-weight: 700;
+        color: var(--text-primary);
+        text-transform: capitalize;
+    }
+    .health-status {
+        display: flex;
+        align-items: center;
+        gap: 5px;
+        padding: 2px 8px;
+        border-radius: 5px;
+        font-size: 0.62rem;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        white-space: nowrap;
+    }
+    .health-status-dot {
+        width: 5px;
+        height: 5px;
+        border-radius: 50%;
+        flex-shrink: 0;
+    }
+    .health-status.active {
+        background: rgba(126, 232, 160, 0.1);
+        color: #7ee8a0;
+        border: 1px solid rgba(126, 232, 160, 0.2);
+    }
+    .health-status.active .health-status-dot { background: #7ee8a0; animation: livepulse 2.4s ease-in-out infinite; }
+    .health-status.idle {
+        background: rgba(255, 184, 108, 0.1);
+        color: #ffb86c;
+        border: 1px solid rgba(255, 184, 108, 0.2);
+    }
+    .health-status.idle .health-status-dot { background: #ffb86c; }
+    .health-status.offline {
+        background: rgba(58, 58, 74, 0.4);
+        color: var(--text-dim);
+        border: 1px solid var(--border-subtle);
+    }
+    .health-status.offline .health-status-dot { background: var(--text-dim); }
+    .health-meta {
+        display: flex;
+        flex-direction: column;
+        gap: 3px;
+    }
+    .health-meta-row {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 8px;
+    }
+    .health-meta-label {
+        font-size: 0.62rem;
+        color: var(--text-dim);
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+    }
+    .health-meta-val {
+        font-size: 0.68rem;
+        font-weight: 600;
+        color: var(--text-secondary);
+        font-family: 'SF Mono', 'Fira Code', monospace;
+    }
+
     @media (max-width: 768px) {
         .stats-grid { grid-template-columns: 1fr; }
         .main-grid { grid-template-columns: 1fr; }
         .stat-value { font-size: 1.5rem; }
+        .health-grid { grid-template-columns: 1fr 1fr; }
     }
 </style>
 </head>
@@ -862,6 +1066,40 @@ _HTML_TEMPLATE = '''<!DOCTYPE html>
                     <span class="model-cost-dot" :style="{ background: mc.color }"></span>
                     <span class="model-cost-name">{{ mc.short }}</span>
                     <span class="model-cost-val">{{ fmtCost(mc.cost) }}</span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Agent Health Monitor -->
+    <div class="health-card" v-if="agent_health && agent_health.length">
+        <div class="card-title">Agent Health</div>
+        <div class="health-grid">
+            <div v-for="agent in agent_health" :key="agent.name" class="health-agent">
+                <div class="health-agent-head">
+                    <span class="health-agent-name">{{ agent.name }}</span>
+                    <span class="health-status" :class="agent.status">
+                        <span class="health-status-dot"></span>
+                        {{ agent.status }}
+                    </span>
+                </div>
+                <div class="health-meta">
+                    <div class="health-meta-row" v-if="agent.last_activity_ago">
+                        <span class="health-meta-label">Last activity</span>
+                        <span class="health-meta-val">{{ agent.last_activity_ago }}</span>
+                    </div>
+                    <div class="health-meta-row" v-else-if="agent.status === 'offline'">
+                        <span class="health-meta-label">Last activity</span>
+                        <span class="health-meta-val" style="color: var(--text-dim)">\u2014</span>
+                    </div>
+                    <div class="health-meta-row" v-if="agent.uptime">
+                        <span class="health-meta-label">Uptime</span>
+                        <span class="health-meta-val">{{ agent.uptime }}</span>
+                    </div>
+                    <div class="health-meta-row" v-if="agent.session_started">
+                        <span class="health-meta-label">Started</span>
+                        <span class="health-meta-val">{{ agent.session_started }}</span>
+                    </div>
                 </div>
             </div>
         </div>
