@@ -1832,12 +1832,18 @@ Vue.createApp({
                     agentsConfig[a.name] = { visible: a.visible, display_name: a.display_name || '' };
                 }
                 try {
-                    const res = await fetch('/api/config', {
+                    await fetch('/api/config', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ agents: agentsConfig }),
                     });
-                    if (res.ok) await this.refresh();
+                    // Fetch fresh data directly — bypass refreshing guard so a concurrent
+                    // timer can't silently swallow the post-save update.
+                    const res = await fetch('/api/data');
+                    if (res.ok) {
+                        const data = await res.json();
+                        Object.keys(data).forEach(k => { this[k] = data[k]; });
+                    }
                 } catch (e) {
                     console.warn('Auto-save failed:', e);
                 }
@@ -1880,7 +1886,7 @@ Vue.createApp({
                 const res = await fetch('/api/data');
                 if (res.ok) {
                     const data = await res.json();
-                    Object.assign(this.$data, data);
+                    Object.keys(data).forEach(k => { this[k] = data[k]; });
                 }
             } catch (e) {
                 console.warn('Dashboard refresh failed:', e);
