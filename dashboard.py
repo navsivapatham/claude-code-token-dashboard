@@ -305,7 +305,7 @@ def collect_agent_health():
             "name": name,
             "status": status,
             "last_activity": last_activity.strftime("%H:%M:%S") if last_activity else None,
-            "last_activity_ago": _fmt_ago(last_activity, now) if last_activity else None,
+            "last_activity_ts": last_activity.timestamp() if last_activity else None,
             "uptime": uptime,
             "session_started": session_started,
         })
@@ -1084,13 +1084,11 @@ _HTML_TEMPLATE = '''<!DOCTYPE html>
                     </span>
                 </div>
                 <div class="health-meta">
-                    <div class="health-meta-row" v-if="agent.last_activity_ago">
+                    <div class="health-meta-row">
                         <span class="health-meta-label">Last activity</span>
-                        <span class="health-meta-val">{{ agent.last_activity_ago }}</span>
-                    </div>
-                    <div class="health-meta-row" v-else-if="agent.status === 'offline'">
-                        <span class="health-meta-label">Last activity</span>
-                        <span class="health-meta-val" style="color: var(--text-dim)">\u2014</span>
+                        <span class="health-meta-val" :style="agent.last_activity_ts ? {} : { color: 'var(--text-dim)' }">
+                            {{ fmtAgo(agent.last_activity_ts) }}
+                        </span>
                     </div>
                     <div class="health-meta-row" v-if="agent.uptime">
                         <span class="health-meta-label">Uptime</span>
@@ -1268,6 +1266,7 @@ Vue.createApp({
             refreshing: false,
             lineTab: 'model',
             hoverIdx: null,
+            healthNow: Date.now(),
         };
     },
 
@@ -1416,6 +1415,26 @@ Vue.createApp({
         onLineLeave() {
             this.hoverIdx = null;
         },
+        fmtAgo(ts) {
+            if (!ts) return '\u2014';
+            const secs = Math.floor((this.healthNow - ts * 1000) / 1000);
+            if (secs < 0)   return 'just now';
+            if (secs < 60)  return secs + 's ago';
+            if (secs < 3600) return Math.floor(secs / 60) + 'm ago';
+            if (secs < 86400) return Math.floor(secs / 3600) + 'h ago';
+            return Math.floor(secs / 86400) + 'd ago';
+        },
+        async refreshHealth() {
+            try {
+                const res = await fetch('/api/health');
+                if (res.ok) {
+                    const data = await res.json();
+                    this.agent_health = data.agents;
+                }
+            } catch (e) {
+                console.warn('Health poll failed:', e);
+            }
+        },
         async refresh() {
             if (this.refreshing) return;
             this.refreshing = true;
@@ -1434,7 +1453,9 @@ Vue.createApp({
     },
 
     mounted() {
+        setInterval(() => { this.healthNow = Date.now(); }, 1000);
         if (SERVE_MODE) {
+            setInterval(this.refreshHealth, 5 * 1000);
             setInterval(this.refresh, 5 * 60 * 1000);
         }
     },
@@ -1474,6 +1495,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
             sessions = collect_all_data()
             data = compute_dashboard_data(sessions)
             payload = json.dumps(data).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            self.wfile.write(payload)
+
+        elif self.path == "/api/health":
+            payload = json.dumps({
+                "agents": collect_agent_health(),
+                "server_time": datetime.now().timestamp(),
+            }).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Cache-Control", "no-cache")
