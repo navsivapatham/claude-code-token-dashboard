@@ -13,7 +13,7 @@ A local dashboard that parses your Claude Code session transcripts and shows tok
 - **Usage by model** — all-time token breakdown across Opus, Sonnet, and Haiku
 - **Session-level detail** — input, output, cache write, and cache read tokens per session
 - **Reactive live server** — Vue 3 powered, polls `/api/data` every 5 minutes and updates in place without a page reload
-- **Self-contained static HTML** — zero runtime dependencies, works offline
+- **Zero Python dependencies** — standard library only, no pip installs
 
 ## Requirements
 
