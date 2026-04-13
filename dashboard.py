@@ -23,6 +23,7 @@ from pathlib import Path
 from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 
 PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
+CONFIG_FILE  = os.path.expanduser("~/.claude-dashboard-config.json")
 
 AGENT_PALETTE = ["#6c9bff", "#ff6cab", "#ffb86c", "#7ee8a0", "#c4a0ff", "#ff8a80", "#80d8ff", "#ffd54f"]
 MODEL_PALETTE = {"opus": "#a855f7", "sonnet": "#6c9bff", "haiku": "#7ee8a0"}
@@ -218,6 +219,61 @@ def _entry_cost(model, input_t, output_t, cache_read_t, cache_write_t):
 
 
 # ---------------------------------------------------------------------------
+# Config persistence
+# ---------------------------------------------------------------------------
+
+def load_config():
+    """Load dashboard config from ~/.claude-dashboard-config.json."""
+    try:
+        with open(CONFIG_FILE) as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_config(config):
+    """Write config to disk."""
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(config, f, indent=2)
+
+
+def _agent_visible(name, config):
+    return config.get("agents", {}).get(name, {}).get("visible", True)
+
+
+def collect_agent_paths():
+    """Return {agent_name: [decoded project-dir paths]} for every detected agent."""
+    paths = defaultdict(set)
+    pattern = os.path.join(PROJECTS_DIR, "**", "*.jsonl")
+    for filepath in glob.glob(pattern, recursive=True):
+        agent = detect_agent(filepath)
+        for part in Path(filepath).parts:
+            if part.startswith("-") and "-" in part[1:]:
+                # Best-effort decode: strip leading dash, replace dashes → slashes
+                decoded = "/" + part.lstrip("-").replace("-", "/")
+                paths[agent].add(decoded)
+                break
+    return {k: sorted(v) for k, v in paths.items()}
+
+
+def build_all_agents(config):
+    """Build the complete agent list for the settings panel (unfiltered)."""
+    agent_paths = collect_agent_paths()
+    cfg_agents = config.get("agents", {})
+    all_names = sorted(set(agent_paths) | set(cfg_agents))
+    result = []
+    for name in all_names:
+        c = cfg_agents.get(name, {})
+        result.append({
+            "name": name,
+            "display_name": c.get("display_name", ""),
+            "visible": c.get("visible", True),
+            "paths": agent_paths.get(name, []),
+        })
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Agent health monitoring
 # ---------------------------------------------------------------------------
 
@@ -375,7 +431,7 @@ def collect_agent_health():
 # Line graph data (last N hours, 5-min buckets)
 # ---------------------------------------------------------------------------
 
-def compute_line_data(sessions, hours=5, bucket_minutes=5):
+def compute_line_data(sessions, hours=5, bucket_minutes=5, config=None):
     """Return per-5-minute token usage for the last N hours, grouped by model and agent."""
     now = datetime.now().astimezone()
     cutoff = now - timedelta(hours=hours)
@@ -407,6 +463,8 @@ def compute_line_data(sessions, hours=5, bucket_minutes=5):
                 continue
             model = entry.get("model", "unknown")
             agent = entry.get("agent", s["agent"])
+            if config and not _agent_visible(agent, config):
+                continue
             total = entry["input_tokens"] + entry["output_tokens"] + entry["cache_creation_input_tokens"]
             ec = _entry_cost(model, entry["input_tokens"], entry["output_tokens"],
                              entry["cache_read_input_tokens"], entry["cache_creation_input_tokens"])
@@ -438,8 +496,10 @@ def compute_line_data(sessions, hours=5, bucket_minutes=5):
 # Dashboard data computation
 # ---------------------------------------------------------------------------
 
-def compute_dashboard_data(sessions):
+def compute_dashboard_data(sessions, config=None):
     """Compute all dashboard data and return as a JSON-serializable dict."""
+    if config is None:
+        config = {}
     now = datetime.now().astimezone()
     today = now.date()
 
@@ -456,6 +516,9 @@ def compute_dashboard_data(sessions):
     model_period_costs = defaultdict(lambda: {"today": 0.0, "week": 0.0, "all_time": 0.0})
 
     for sid, s in sorted_sessions_list:
+        session_agent = s["agent"]
+        if not _agent_visible(session_agent, config):
+            continue
         for entry in s.get("entries", []):
             et = entry.get("parsed_timestamp") or s["first_timestamp"]
             if et is None:
@@ -480,7 +543,7 @@ def compute_dashboard_data(sessions):
                 if day == today:
                     model_period_costs[model]["today"] += ec
             if day == today:
-                agent = entry.get("agent", s["agent"])
+                agent = entry.get("agent", session_agent)
                 for k in token_keys:
                     agent_today[agent][k] += entry[k]
                 agent_today[agent]["cost"] += ec
@@ -517,11 +580,12 @@ def compute_dashboard_data(sessions):
         all_time_cost += dv.get("cost", 0.0)
     all_time_total = all_time["input_tokens"] + all_time["output_tokens"] + all_time["cache_creation_input_tokens"]
 
-    # Agent colors
-    all_agents = sorted(set(s["agent"] for _, s in sorted_sessions_list))
-    agent_colors = {agent: AGENT_PALETTE[i % len(AGENT_PALETTE)] for i, agent in enumerate(all_agents)}
+    # Agent colors (assign palette index across ALL agents so colors stay stable when some are hidden)
+    all_agents_unfiltered = sorted(set(s["agent"] for _, s in sorted_sessions_list))
+    agent_colors = {agent: AGENT_PALETTE[i % len(AGENT_PALETTE)] for i, agent in enumerate(all_agents_unfiltered)}
+    all_agents = [a for a in all_agents_unfiltered if _agent_visible(a, config)]
 
-    # Agents today
+    # Agents today (visible only)
     agents_today_data = []
     for agent in all_agents:
         a = agent_today.get(agent, {**dict.fromkeys(token_keys, 0), "cost": 0.0})
@@ -566,9 +630,11 @@ def compute_dashboard_data(sessions):
             "color": _model_color(model_name),
         })
 
-    # Sessions
+    # Sessions (visible agents only)
     sessions_data = []
     for sid, s in sorted_sessions_list:
+        if not _agent_visible(s["agent"], config):
+            continue
         total = s["input_tokens"] + s["output_tokens"] + s["cache_creation_input_tokens"]
         ts = s["first_timestamp"]
         ts_local = ts.astimezone() if ts else None
@@ -622,8 +688,10 @@ def compute_dashboard_data(sessions):
         "sessions": sessions_data,
         "updated": now.strftime("%b %d, %Y at %H:%M"),
         "agent_colors": agent_colors,
-        "line": compute_line_data(sessions),
+        "line": compute_line_data(sessions, config=config),
         "agent_health": collect_agent_health(),
+        "all_agents": build_all_agents(config),
+        "config_file": CONFIG_FILE,
     }
 
 
@@ -706,6 +774,196 @@ _HTML_TEMPLATE = '''<!DOCTYPE html>
     }
     .refresh-btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
     .refresh-btn:disabled { opacity: 0.4; cursor: default; }
+    .settings-btn {
+        background: none;
+        border: 1px solid var(--border);
+        color: var(--text-secondary);
+        border-radius: 6px;
+        padding: 2px 7px;
+        font-size: 0.82rem;
+        cursor: pointer;
+        transition: border-color 0.15s, color 0.15s;
+        line-height: 1.6;
+        margin-left: auto;
+    }
+    .settings-btn:hover { border-color: var(--accent); color: var(--accent); }
+
+    /* Settings panel */
+    .settings-overlay {
+        position: fixed; inset: 0;
+        background: rgba(0,0,0,0.55);
+        z-index: 100;
+        backdrop-filter: blur(2px);
+    }
+    .settings-panel {
+        position: fixed;
+        top: 0; right: 0; bottom: 0;
+        width: 380px;
+        background: #0e0e16;
+        border-left: 1px solid var(--border);
+        z-index: 101;
+        display: flex;
+        flex-direction: column;
+        transform: translateX(100%);
+        transition: transform 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+        box-shadow: -16px 0 48px rgba(0,0,0,0.5);
+    }
+    .settings-panel.open { transform: translateX(0); }
+    .settings-panel-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 20px 22px 16px;
+        border-bottom: 1px solid var(--border);
+        flex-shrink: 0;
+    }
+    .settings-panel-title {
+        font-size: 0.9rem;
+        font-weight: 700;
+        color: var(--text-primary);
+        letter-spacing: -0.01em;
+    }
+    .settings-close {
+        background: none;
+        border: 1px solid var(--border);
+        color: var(--text-secondary);
+        border-radius: 6px;
+        width: 26px; height: 26px;
+        display: flex; align-items: center; justify-content: center;
+        font-size: 0.8rem;
+        cursor: pointer;
+        transition: border-color 0.15s, color 0.15s;
+    }
+    .settings-close:hover { border-color: var(--text-secondary); color: var(--text-primary); }
+    .settings-body {
+        flex: 1;
+        overflow-y: auto;
+        padding: 20px 22px;
+        display: flex;
+        flex-direction: column;
+        gap: 16px;
+    }
+    .settings-body::-webkit-scrollbar { width: 4px; }
+    .settings-body::-webkit-scrollbar-track { background: transparent; }
+    .settings-body::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+    .settings-section-label {
+        font-size: 0.65rem;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.1em;
+        color: var(--text-dim);
+        margin-bottom: -8px;
+    }
+    .settings-hint {
+        font-size: 0.72rem;
+        color: var(--text-dim);
+        line-height: 1.5;
+        margin-bottom: -4px;
+    }
+    .settings-agent-list {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+    }
+    .settings-agent-row {
+        display: flex;
+        align-items: flex-start;
+        gap: 12px;
+        padding: 12px 14px;
+        border-radius: 8px;
+        border: 1px solid var(--border-subtle);
+        background: var(--bg-primary);
+        transition: border-color 0.15s;
+    }
+    .settings-agent-row:hover { border-color: var(--border); }
+    .settings-agent-row.hidden-agent { opacity: 0.45; }
+    /* Toggle switch */
+    .toggle-wrap { flex-shrink: 0; padding-top: 2px; }
+    .toggle-input { display: none; }
+    .toggle-track {
+        display: block;
+        width: 34px; height: 19px;
+        background: var(--border);
+        border-radius: 10px;
+        position: relative;
+        cursor: pointer;
+        transition: background 0.2s;
+    }
+    .toggle-input:checked + .toggle-track { background: var(--accent); }
+    .toggle-thumb {
+        position: absolute;
+        top: 2px; left: 2px;
+        width: 15px; height: 15px;
+        background: #fff;
+        border-radius: 50%;
+        transition: transform 0.2s;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.3);
+    }
+    .toggle-input:checked + .toggle-track .toggle-thumb { transform: translateX(15px); }
+    /* Agent info */
+    .settings-agent-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 5px; }
+    .settings-agent-raw {
+        font-size: 0.72rem;
+        font-weight: 700;
+        color: var(--text-primary);
+        font-family: 'SF Mono', 'Fira Code', monospace;
+    }
+    .settings-name-input {
+        background: var(--bg-card);
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 5px 9px;
+        font-size: 0.72rem;
+        color: var(--text-primary);
+        width: 100%;
+        transition: border-color 0.15s;
+        font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', sans-serif;
+    }
+    .settings-name-input:focus { outline: none; border-color: var(--accent); }
+    .settings-name-input:disabled { opacity: 0.4; cursor: not-allowed; }
+    .settings-agent-paths {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+    }
+    .settings-agent-path {
+        font-size: 0.6rem;
+        color: var(--text-dim);
+        font-family: 'SF Mono', 'Fira Code', monospace;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+    /* Save footer */
+    .settings-footer {
+        border-top: 1px solid var(--border);
+        padding: 16px 22px 20px;
+        flex-shrink: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+    }
+    .settings-save-btn {
+        background: var(--accent);
+        border: none;
+        border-radius: 8px;
+        color: #fff;
+        font-size: 0.78rem;
+        font-weight: 700;
+        padding: 9px 18px;
+        cursor: pointer;
+        width: 100%;
+        transition: opacity 0.15s;
+        letter-spacing: 0.01em;
+    }
+    .settings-save-btn:hover:not(:disabled) { opacity: 0.85; }
+    .settings-save-btn:disabled { opacity: 0.4; cursor: default; }
+    .settings-config-path {
+        font-size: 0.6rem;
+        color: var(--text-dim);
+        font-family: 'SF Mono', 'Fira Code', monospace;
+        text-align: center;
+    }
 
     /* Stats Grid */
     .stats-grid {
@@ -1102,6 +1360,46 @@ _HTML_TEMPLATE = '''<!DOCTYPE html>
             <button v-if="serveMode" @click="refresh" class="refresh-btn" :disabled="refreshing">
                 {{ refreshing ? '\u2026' : '\u21bb' }}
             </button>
+            <button @click="openSettings" class="settings-btn" title="Settings">\u2699</button>
+        </div>
+    </div>
+
+    <!-- Settings overlay + panel -->
+    <div class="settings-overlay" v-if="settingsOpen" @click="closeSettings"></div>
+    <div class="settings-panel" :class="{ open: settingsOpen }">
+        <div class="settings-panel-head">
+            <span class="settings-panel-title">\u2699 Settings</span>
+            <button class="settings-close" @click="closeSettings">\u2715</button>
+        </div>
+        <div class="settings-body">
+            <div class="settings-section-label">Agents</div>
+            <p class="settings-hint">Toggle visibility to exclude agents from all metrics. Set a display name to override the auto-detected label.</p>
+            <div class="settings-agent-list">
+                <div v-for="a in agentDraft" :key="a.name"
+                     class="settings-agent-row" :class="{ 'hidden-agent': !a.visible }">
+                    <label class="toggle-wrap">
+                        <input class="toggle-input" type="checkbox" :checked="a.visible"
+                               @change="a.visible = $event.target.checked">
+                        <span class="toggle-track"><span class="toggle-thumb"></span></span>
+                    </label>
+                    <div class="settings-agent-info">
+                        <span class="settings-agent-raw">{{ a.name }}</span>
+                        <input class="settings-name-input"
+                               :placeholder="'Display name (default: ' + a.name + ')'"
+                               v-model="a.display_name"
+                               :disabled="!a.visible">
+                        <div class="settings-agent-paths" v-if="a.paths && a.paths.length">
+                            <span v-for="p in a.paths" :key="p" class="settings-agent-path" :title="p">{{ p }}</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="settings-footer">
+            <button class="settings-save-btn" @click="saveSettings" :disabled="savingSettings || !serveMode">
+                {{ !serveMode ? 'Save disabled in static mode' : savingSettings ? 'Saving\u2026' : 'Save Settings' }}
+            </button>
+            <div class="settings-config-path">{{ configFile }}</div>
         </div>
     </div>
 
@@ -1163,7 +1461,7 @@ _HTML_TEMPLATE = '''<!DOCTYPE html>
         <div class="health-grid">
             <div v-for="agent in agent_health" :key="agent.name" class="health-agent">
                 <div class="health-agent-head">
-                    <span class="health-agent-name">{{ agent.name }}</span>
+                    <span class="health-agent-name">{{ displayName(agent.name) }}</span>
                     <span class="health-status" :class="agent.status">
                         <span class="health-status-dot"></span>
                         {{ agent.status }}
@@ -1266,7 +1564,7 @@ _HTML_TEMPLATE = '''<!DOCTYPE html>
             <div class="card-title">Today by Agent</div>
             <div v-if="agents_today.length === 0" class="dim" style="padding:20px 0;text-align:center">No usage today</div>
             <div v-for="agent in agents_today" :key="agent.name" class="agent-row">
-                <span class="badge" :style="badgeStyle(agent.color)">{{ agent.name }}</span>
+                <span class="badge" :style="badgeStyle(agent.color)">{{ displayName(agent.name) }}</span>
                 <template v-if="agent.total > 0">
                     <div class="agent-bar-wrap">
                         <div class="agent-bar" :style="{ width: agent.bar_pct + '%', background: agent.color + '40' }"></div>
@@ -1339,7 +1637,7 @@ _HTML_TEMPLATE = '''<!DOCTYPE html>
                 <tbody>
                     <tr v-for="session in sessions" :key="session.id" :class="{ today: session.is_today }">
                         <td class="mono">{{ session.id }}</td>
-                        <td><span class="badge" :style="badgeStyle(session.agent_color)">{{ session.agent }}</span></td>
+                        <td><span class="badge" :style="badgeStyle(session.agent_color)">{{ displayName(session.agent) }}</span></td>
                         <td><span class="badge" :style="badgeStyle(session.model_color)">{{ session.model_short }}</span></td>
                         <td>{{ session.date }}</td>
                         <td class="num">{{ fmt(session.input) }}</td>
@@ -1369,6 +1667,9 @@ Vue.createApp({
             lineTab: 'model',
             hoverIdx: null,
             healthNow: Date.now(),
+            settingsOpen: false,
+            agentDraft: [],
+            savingSettings: false,
         };
     },
 
@@ -1397,7 +1698,7 @@ Vue.createApp({
 
             const series = tab === 'model'
                 ? this.line.models.map(m => ({ key: m, label: this.modelShort(m), color: this.modelColor(m) }))
-                : this.line.agents.map(a => ({ key: a, label: a, color: this.agentColor(a) }));
+                : this.line.agents.map(a => ({ key: a, label: this.displayName(a), color: this.agentColor(a) }));
 
             return series.map(s => {
                 const coords = buckets.map((b, i) => {
@@ -1517,6 +1818,41 @@ Vue.createApp({
         onLineLeave() {
             this.hoverIdx = null;
         },
+        displayName(raw) {
+            if (!this.all_agents) return raw;
+            const a = this.all_agents.find(x => x.name === raw);
+            return (a && a.display_name) ? a.display_name : raw;
+        },
+        openSettings() {
+            this.agentDraft = JSON.parse(JSON.stringify(this.all_agents || []));
+            this.settingsOpen = true;
+        },
+        closeSettings() {
+            this.settingsOpen = false;
+        },
+        async saveSettings() {
+            if (this.savingSettings) return;
+            this.savingSettings = true;
+            try {
+                const agentsConfig = {};
+                for (const a of this.agentDraft) {
+                    agentsConfig[a.name] = { visible: a.visible, display_name: a.display_name || '' };
+                }
+                const res = await fetch('/api/config', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ agents: agentsConfig }),
+                });
+                if (res.ok) {
+                    this.closeSettings();
+                    await this.refresh();
+                }
+            } catch (e) {
+                console.warn('Settings save failed:', e);
+            } finally {
+                this.savingSettings = false;
+            }
+        },
         ctxBarColor(pct) {
             if (pct < 60) return '#7ee8a0';
             if (pct < 85) return '#ffb86c';
@@ -1595,8 +1931,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path in ("/", "/index.html"):
+            config = load_config()
             sessions = collect_all_data()
-            data = compute_dashboard_data(sessions)
+            data = compute_dashboard_data(sessions, config=config)
             html = generate_html(data, serve_mode=True)
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -1604,8 +1941,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.wfile.write(html.encode("utf-8"))
 
         elif self.path == "/api/data":
+            config = load_config()
             sessions = collect_all_data()
-            data = compute_dashboard_data(sessions)
+            data = compute_dashboard_data(sessions, config=config)
             payload = json.dumps(data).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -1624,6 +1962,24 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(payload)
 
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_POST(self):
+        if self.path == "/api/config":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(length)
+                config = json.loads(body)
+                save_config(config)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"ok":true}')
+            except (json.JSONDecodeError, OSError, ValueError):
+                self.send_response(400)
+                self.end_headers()
         else:
             self.send_response(404)
             self.end_headers()
@@ -1666,7 +2022,7 @@ def main():
         sessions = collect_all_data()
         print(f"Found {len(sessions)} sessions")
 
-        data = compute_dashboard_data(sessions)
+        data = compute_dashboard_data(sessions, config=load_config())
         html = generate_html(data, serve_mode=False)
 
         output = os.path.abspath(args.output)
