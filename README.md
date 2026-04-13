@@ -74,6 +74,8 @@ Claude Code stores session transcripts as JSONL files in `~/.claude/projects/`. 
 
 Agent names are auto-detected from the directory structure — no configuration needed.
 
+**There is no pre-built HTML file in this repo.** The entire dashboard template is embedded inside `dashboard.py`. Running the script generates `token_dashboard.html` (static mode) or serves it live (server mode) with your own data filled in.
+
 No data leaves your machine.
 
 ## Contributing
