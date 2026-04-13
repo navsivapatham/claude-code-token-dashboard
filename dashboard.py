@@ -89,6 +89,7 @@ def parse_jsonl_file(filepath):
                     "cache_read_input_tokens": usage.get("cache_read_input_tokens", 0),
                     "output_tokens": usage.get("output_tokens", 0),
                     "timestamp": data.get("timestamp", ts),
+                    "model": msg.get("model", ""),
                 })
     except (IOError, OSError):
         pass
@@ -120,6 +121,7 @@ def collect_all_data():
         "first_timestamp": None,
         "last_timestamp": None,
         "entries": [],
+        "models": defaultdict(int),
     })
 
     for filepath in files:
@@ -139,6 +141,8 @@ def collect_all_data():
             session["cache_creation_input_tokens"] += entry["cache_creation_input_tokens"]
             session["cache_read_input_tokens"] += entry["cache_read_input_tokens"]
             session["output_tokens"] += entry["output_tokens"]
+            if entry.get("model"):
+                session["models"][entry["model"]] += 1
 
             et = parse_timestamp(entry.get("timestamp"))
             if et:
@@ -218,6 +222,17 @@ def generate_html(sessions):
             all_time[k] += d[k]
     all_time_total = all_time["input_tokens"] + all_time["output_tokens"] + all_time["cache_creation_input_tokens"]
 
+    # Model breakdown (all-time)
+    model_totals = defaultdict(lambda: {"input_tokens": 0, "output_tokens": 0, "cache_creation_input_tokens": 0, "count": 0})
+    for sid, s in sorted_sessions:
+        for entry in s.get("entries", []):
+            model = entry.get("model", "")
+            if model:
+                model_totals[model]["input_tokens"] += entry["input_tokens"]
+                model_totals[model]["output_tokens"] += entry["output_tokens"]
+                model_totals[model]["cache_creation_input_tokens"] += entry["cache_creation_input_tokens"]
+                model_totals[model]["count"] += 1
+
     # Discover all agents
     all_agents = sorted(set(s["agent"] for _, s in sorted_sessions))
 
@@ -233,6 +248,50 @@ def generate_html(sessions):
         safe = agent.replace(" ", "-").replace("/", "-")
         agent_css += f"    .agent-{safe} {{ background: {color}18; color: {color}; }}\n"
 
+    # Model color mapping
+    model_palette = {"opus": "#a855f7", "sonnet": "#6c9bff", "haiku": "#7ee8a0"}
+    def model_color(name):
+        for key, color in model_palette.items():
+            if key in name:
+                return color
+        return "#8a8a9a"
+
+    def model_short(name):
+        """Shorten model ID to a readable name."""
+        if not name:
+            return "—"
+        # claude-opus-4-6 -> Opus 4.6, claude-sonnet-4-6 -> Sonnet 4.6
+        parts = name.replace("claude-", "").split("-")
+        if len(parts) >= 3 and parts[1].isdigit():
+            return f"{parts[0].title()} {parts[1]}.{parts[2]}"
+        if len(parts) >= 2:
+            return f"{parts[0].title()}"
+        return name
+
+    # Build model CSS
+    model_css = ""
+    for model_name in model_totals:
+        safe = model_name.replace("-", "_").replace(".", "_")
+        color = model_color(model_name)
+        model_css += f"    .model-{safe} {{ background: {color}18; color: {color}; }}\n"
+
+    # Build model breakdown rows
+    model_rows = ""
+    sorted_models = sorted(model_totals.items(), key=lambda x: x[1]["input_tokens"] + x[1]["output_tokens"] + x[1]["cache_creation_input_tokens"], reverse=True)
+    max_model_total = max((m[1]["input_tokens"] + m[1]["output_tokens"] + m[1]["cache_creation_input_tokens"] for m in sorted_models), default=1) or 1
+    for model_name, m in sorted_models:
+        total = m["input_tokens"] + m["output_tokens"] + m["cache_creation_input_tokens"]
+        bar_w = min((total / max_model_total) * 100, 100)
+        color = model_color(model_name)
+        safe = model_name.replace("-", "_").replace(".", "_")
+        model_rows += f"""<div class="agent-row">
+            <span class="badge model-{safe}">{model_short(model_name)}</span>
+            <div class="agent-bar-wrap">
+                <div class="agent-bar" style="width: {bar_w:.0f}%; background: {color}40;"></div>
+            </div>
+            <span class="agent-total">{fmt(total)}</span>
+        </div>"""
+
     # Session rows
     session_rows = ""
     for sid, s in sorted_sessions:
@@ -243,9 +302,13 @@ def generate_html(sessions):
         day = ts_local.date() if ts_local else None
         is_today = ' class="today"' if day == today else ""
         safe_agent = s["agent"].replace(" ", "-").replace("/", "-")
+        # Primary model = most frequently used in this session
+        primary_model = max(s["models"], key=s["models"].get) if s["models"] else ""
+        model_safe = primary_model.replace("-", "_").replace(".", "_")
         session_rows += f"""<tr{is_today}>
             <td class="mono">{sid[:12]}</td>
             <td><span class="badge agent-{safe_agent}">{s['agent']}</span></td>
+            <td><span class="badge model-{model_safe}">{model_short(primary_model)}</span></td>
             <td>{date_str}</td>
             <td class="num">{fmt(s['input_tokens'])}</td>
             <td class="num">{fmt(s['output_tokens'])}</td>
@@ -386,9 +449,14 @@ def generate_html(sessions):
     /* Main Grid */
     .main-grid {{
         display: grid;
-        grid-template-columns: 2fr 1fr;
+        grid-template-columns: 3fr 2fr;
         gap: 16px;
         margin-bottom: 24px;
+    }}
+    .side-grid {{
+        display: grid;
+        grid-template-rows: 1fr 1fr;
+        gap: 16px;
     }}
     .card {{
         background: var(--bg-card);
@@ -497,6 +565,7 @@ def generate_html(sessions):
         white-space: nowrap;
     }}
 {agent_css}
+{model_css}
 
     /* Sessions Table */
     .table-card {{
@@ -590,9 +659,15 @@ def generate_html(sessions):
                 {chart_bars}
             </div>
         </div>
-        <div class="card">
-            <div class="card-title">Today by Agent</div>
-            {agent_rows if agent_rows else '<div class="dim" style="padding: 20px 0; text-align: center;">No usage today</div>'}
+        <div class="side-grid">
+            <div class="card">
+                <div class="card-title">Today by Agent</div>
+                {agent_rows if agent_rows else '<div class="dim" style="padding: 20px 0; text-align: center;">No usage today</div>'}
+            </div>
+            <div class="card">
+                <div class="card-title">Usage by Model</div>
+                {model_rows if model_rows else '<div class="dim" style="padding: 20px 0; text-align: center;">No data</div>'}
+            </div>
         </div>
     </div>
 
@@ -606,6 +681,7 @@ def generate_html(sessions):
                     <tr>
                         <th>Session</th>
                         <th>Agent</th>
+                        <th>Model</th>
                         <th>Date</th>
                         <th style="text-align:right">Input</th>
                         <th style="text-align:right">Output</th>
