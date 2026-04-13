@@ -8,6 +8,7 @@ self-contained HTML dashboard showing token usage statistics.
 Usage:
     python3 dashboard.py              # Generate static HTML file
     python3 dashboard.py --serve      # Start live dashboard server
+    python3 dashboard.py --serve --lan  # Bind to 0.0.0.0 (LAN accessible)
     python3 dashboard.py --port 3000  # Custom port (default: 8080)
 """
 
@@ -2045,14 +2046,22 @@ class DashboardHandler(BaseHTTPRequestHandler):
         pass
 
 
-def serve(port=8080):
+def serve(port=8080, lan=False):
     """Start a local HTTP server that serves a live, auto-refreshing dashboard."""
-    server = ThreadingHTTPServer(("127.0.0.1", port), DashboardHandler)
-    url = f"http://localhost:{port}"
-    print(f"Dashboard running at {url}")
+    host = "0.0.0.0" if lan else "127.0.0.1"
+    server = ThreadingHTTPServer((host, port), DashboardHandler)
+    local_url = f"http://localhost:{port}"
+    print(f"Dashboard running at {local_url}")
+    if lan:
+        import socket
+        try:
+            lan_ip = socket.gethostbyname(socket.gethostname())
+        except Exception:
+            lan_ip = "your-mac-ip"
+        print(f"LAN access:        http://{lan_ip}:{port}")
     print("Auto-refreshes every 5 minutes. Press Ctrl+C to stop.\n")
 
-    webbrowser.open(url)
+    webbrowser.open(local_url)
 
     try:
         server.serve_forever()
@@ -2069,11 +2078,12 @@ def main():
     parser = argparse.ArgumentParser(description="Claude Code Token Dashboard")
     parser.add_argument("--serve", action="store_true", help="Start a live dashboard server")
     parser.add_argument("--port", type=int, default=8080, help="Server port (default: 8080)")
+    parser.add_argument("--lan", action="store_true", help="Bind to 0.0.0.0 so other devices on the LAN can access the dashboard")
     parser.add_argument("--output", "-o", default="token_dashboard.html", help="Output HTML file path")
     args = parser.parse_args()
 
     if args.serve:
-        serve(args.port)
+        serve(args.port, lan=args.lan)
     else:
         print("Scanning sessions...")
         sessions = collect_all_data()
