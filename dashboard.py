@@ -181,6 +181,14 @@ def _model_short(name):
 # Pricing
 # ---------------------------------------------------------------------------
 
+# Context window sizes in tokens.
+CONTEXT_WINDOWS = {
+    "opus":   1_000_000,
+    "sonnet":   200_000,
+    "haiku":    200_000,
+}
+DEFAULT_CONTEXT_WINDOW = 200_000
+
 # Per-million-token prices (USD). Cache read = 10% of input; cache write = 125% of input.
 MODEL_PRICING = {
     "opus-4-6":   {"input": 15.00, "output": 75.00},
@@ -243,6 +251,52 @@ def _fmt_ago(dt, now):
     return f"{secs // 86400}d ago"
 
 
+def _get_last_context_usage(filepath):
+    """Read the tail of a JSONL file and return context window usage from the last message."""
+    TAIL_BYTES = 32 * 1024
+    try:
+        with open(filepath, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - TAIL_BYTES))
+            chunk = f.read().decode("utf-8", errors="replace")
+        for line in reversed(chunk.splitlines()):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            msg = data.get("message")
+            if not isinstance(msg, dict):
+                continue
+            usage = msg.get("usage")
+            if not isinstance(usage, dict):
+                continue
+            model = msg.get("model", "")
+            input_t = usage.get("input_tokens", 0) or 0
+            cache_read_t = usage.get("cache_read_input_tokens", 0) or 0
+            tokens_used = input_t + cache_read_t
+            if tokens_used == 0:
+                continue
+            ctx_window = DEFAULT_CONTEXT_WINDOW
+            for key, size in CONTEXT_WINDOWS.items():
+                if key in model:
+                    ctx_window = size
+                    break
+            pct = min(round((tokens_used / ctx_window) * 100, 1), 100.0)
+            return {
+                "tokens_used": tokens_used,
+                "context_window": ctx_window,
+                "model_short": _model_short(model),
+                "pct": pct,
+            }
+    except (OSError, IOError):
+        pass
+    return None
+
+
 def collect_agent_health():
     """Return a list of agent health records from tmux sessions and JSONL activity."""
     now = datetime.now().astimezone()
@@ -265,8 +319,8 @@ def collect_agent_health():
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         pass
 
-    # --- Last activity per agent from JSONL mtime ---
-    agent_last_activity = {}
+    # --- Last activity per agent from JSONL mtime; track the most-recent filepath too ---
+    agent_last_activity = {}   # name -> (mtime datetime, filepath)
     pattern = os.path.join(PROJECTS_DIR, "**", "*.jsonl")
     for filepath in glob.glob(pattern, recursive=True):
         agent = detect_agent(filepath)
@@ -274,8 +328,9 @@ def collect_agent_health():
             continue
         try:
             mtime = datetime.fromtimestamp(os.path.getmtime(filepath)).astimezone()
-            if agent not in agent_last_activity or mtime > agent_last_activity[agent]:
-                agent_last_activity[agent] = mtime
+            existing = agent_last_activity.get(agent)
+            if existing is None or mtime > existing[0]:
+                agent_last_activity[agent] = (mtime, filepath)
         except OSError:
             pass
 
@@ -284,7 +339,9 @@ def collect_agent_health():
 
     records = []
     for name in all_names:
-        last_activity = agent_last_activity.get(name)
+        entry = agent_last_activity.get(name)
+        last_activity = entry[0] if entry else None
+        latest_file   = entry[1] if entry else None
         tmux_info = tmux_sessions.get(name)
 
         if tmux_info is None:
@@ -308,6 +365,7 @@ def collect_agent_health():
             "last_activity_ts": last_activity.timestamp() if last_activity else None,
             "uptime": uptime,
             "session_started": session_started,
+            "context": _get_last_context_usage(latest_file) if latest_file else None,
         })
 
     return records
@@ -996,6 +1054,34 @@ _HTML_TEMPLATE = '''<!DOCTYPE html>
         color: var(--text-secondary);
         font-family: 'SF Mono', 'Fira Code', monospace;
     }
+    .health-ctx { margin-top: 10px; border-top: 1px solid var(--border-subtle); padding-top: 8px; }
+    .health-ctx-bar-track {
+        height: 4px;
+        background: var(--border-subtle);
+        border-radius: 2px;
+        overflow: hidden;
+        margin-bottom: 5px;
+    }
+    .health-ctx-bar {
+        height: 100%;
+        border-radius: 2px;
+        transition: width 0.4s ease, background 0.3s ease;
+    }
+    .health-ctx-label {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+    }
+    .health-ctx-tokens {
+        font-size: 0.62rem;
+        color: var(--text-dim);
+        font-family: 'SF Mono', 'Fira Code', monospace;
+    }
+    .health-ctx-pct {
+        font-size: 0.68rem;
+        font-weight: 700;
+        font-family: 'SF Mono', 'Fira Code', monospace;
+    }
 
     @media (max-width: 768px) {
         .stats-grid { grid-template-columns: 1fr; }
@@ -1097,6 +1183,22 @@ _HTML_TEMPLATE = '''<!DOCTYPE html>
                     <div class="health-meta-row" v-if="agent.session_started">
                         <span class="health-meta-label">Started</span>
                         <span class="health-meta-val">{{ agent.session_started }}</span>
+                    </div>
+                </div>
+                <div class="health-ctx" v-if="agent.context">
+                    <div class="health-ctx-bar-track">
+                        <div class="health-ctx-bar"
+                             :style="{ width: agent.context.pct + '%', background: ctxBarColor(agent.context.pct) }">
+                        </div>
+                    </div>
+                    <div class="health-ctx-label">
+                        <span class="health-ctx-tokens">
+                            {{ fmtCtx(agent.context.tokens_used) }} / {{ fmtCtx(agent.context.context_window) }}
+                            <span style="color: var(--text-dim); font-weight:400"> ctx</span>
+                        </span>
+                        <span class="health-ctx-pct" :style="{ color: ctxBarColor(agent.context.pct) }">
+                            {{ agent.context.pct }}%
+                        </span>
                     </div>
                 </div>
             </div>
@@ -1414,6 +1516,16 @@ Vue.createApp({
         },
         onLineLeave() {
             this.hoverIdx = null;
+        },
+        ctxBarColor(pct) {
+            if (pct < 60) return '#7ee8a0';
+            if (pct < 85) return '#ffb86c';
+            return '#ff6cab';
+        },
+        fmtCtx(n) {
+            if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+            if (n >= 1000) return Math.round(n / 1000) + 'K';
+            return String(n);
         },
         fmtAgo(ts) {
             if (!ts) return '\u2014';
