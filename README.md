@@ -12,12 +12,13 @@ A local dashboard that parses your Claude Code session transcripts and shows tok
 ## Features
 
 - **Today / Week / All-Time stats** at a glance
-- **Activity line graph** — last 5 hours at 5-minute resolution, switchable between model and agent views, with hover tooltips
+- **Activity line graph** — last 5 hours at 5-minute resolution, switchable between model and agent views, Y-axis labels, hover tooltips
 - **7-day bar chart** showing daily token usage trends
 - **Per-agent breakdown** — today's usage split by agent/project
 - **Usage by model** — all-time token breakdown across Opus, Sonnet, and Haiku
 - **Session-level detail** — input, output, cache write, and cache read tokens per session
-- **Agent Health Monitor** — tmux session status, last-active counter, and context window usage per agent
+- **Agent Health Monitor** — tmux session status, last-active counter, and context window usage; only shows sessions backed by Claude Code transcripts
+- **Activity feed** — real-time log of agent tool calls and messages parsed from JSONL transcripts; filterable by agent and type; polls every 8 seconds in server mode
 - **Settings panel** — toggle agent visibility, set display names; changes apply instantly in server mode
 - **Light / dark mode** — toggle with one click, preference saved to localStorage
 - **Reactive live server** — Vue 3 powered, polls `/api/data` every 5 minutes and updates in place without a page reload
@@ -60,6 +61,10 @@ python3 dashboard.py -o report.html   # Custom output path
 
 ## Layout
 
+The dashboard has two top-level tabs: **Tokens** and **Activity**.
+
+### Tokens tab
+
 ```
 [ Today ] [ This Week ] [ All Time ]
 
@@ -69,7 +74,11 @@ python3 dashboard.py -o report.html   # Custom output path
 [ Sessions table ]
 ```
 
-The activity line graph shows token throughput in 5-minute buckets. Toggle between **Model** (Opus / Sonnet / Haiku) and **Agent** views using the tab in the card header. Hover over the graph to see a tooltip with the exact time and token count for each series at that point.
+The activity line graph shows token throughput in 5-minute buckets. Toggle between **Model** (Opus / Sonnet / Haiku) and **Agent** views using the tab in the card header. Y-axis labels show the max and midpoint values. Hover over the graph to see a tooltip with the exact time and token count for each series at that point.
+
+### Activity tab
+
+A live feed of agent tool calls and messages parsed from JSONL transcripts. Each entry shows the agent name, action type (tool call, message, agent-to-agent comms), a short summary, and a timestamp. Filter by agent or event type using the toolbar dropdowns. In server mode, the feed refreshes every 8 seconds and new entries animate in.
 
 ## How It Works
 

@@ -391,9 +391,11 @@ def collect_agent_health(config=None):
         except OSError:
             pass
 
-    # --- Merge: all known agents from either source, filtered by config ---
+    # --- Merge: only include sessions backed by Claude Code JSONL transcripts.
+    #     A tmux session with no transcript data is not a Claude agent and
+    #     should not appear in the health panel.
     all_names = sorted(
-        n for n in set(tmux_sessions) | set(agent_last_activity)
+        n for n in set(agent_last_activity)
         if _agent_visible(n, config)
     )
 
@@ -429,6 +431,258 @@ def collect_agent_health(config=None):
         })
 
     return records
+
+
+# ---------------------------------------------------------------------------
+# Activity feed
+# ---------------------------------------------------------------------------
+
+def _summarize_tool_call(tool_name, tool_input):
+    """Generate a brief human-readable summary for a tool call."""
+    if not isinstance(tool_input, dict):
+        return ""
+    if tool_name == "Bash":
+        cmd = tool_input.get("command", "")
+        return (cmd[:90] + "…") if len(cmd) > 90 else cmd
+    if tool_name in ("Edit", "MultiEdit"):
+        return tool_input.get("file_path", tool_input.get("path", ""))
+    if tool_name == "Write":
+        return tool_input.get("file_path", tool_input.get("path", ""))
+    if tool_name == "Read":
+        return tool_input.get("file_path", "")
+    if tool_name == "Glob":
+        return tool_input.get("pattern", "")
+    if tool_name == "Grep":
+        pat = tool_input.get("pattern", "")
+        path = tool_input.get("path", "")
+        return f"'{pat}'" + (f" in {path}" if path else "")
+    if tool_name == "WebSearch":
+        q = tool_input.get("query", "")
+        return f"\u201c{q}\u201d" if q else ""
+    if tool_name == "WebFetch":
+        url = tool_input.get("url", "")
+        return (url[:70] + "…") if len(url) > 70 else url
+    if tool_name == "Agent":
+        desc = tool_input.get("description", tool_input.get("prompt", ""))
+        return (desc[:80] + "…") if len(desc) > 80 else desc
+    if tool_name.startswith("mcp__plugin_telegram_telegram__"):
+        action = tool_name.split("__")[-1]
+        if action == "reply":
+            text = tool_input.get("text", "")
+            return (text[:70] + "…") if len(text) > 70 else text
+        if action == "react":
+            return tool_input.get("emoji", "")
+        return action
+    if tool_name.startswith("mcp__"):
+        for key in ("query", "url", "path", "message", "text", "command"):
+            val = tool_input.get(key)
+            if val:
+                v = str(val)
+                return (v[:70] + "…") if len(v) > 70 else v
+    for key in ("path", "file_path", "command", "query", "url", "message", "text"):
+        val = tool_input.get(key)
+        if val:
+            v = str(val)
+            return (v[:70] + "…") if len(v) > 70 else v
+    return ""
+
+
+def _action_label(tool_name):
+    """Return a display-friendly label for a tool name."""
+    labels = {
+        "Bash": "Bash", "Edit": "Edit file", "MultiEdit": "Multi-edit",
+        "Write": "Write file", "Read": "Read file", "Glob": "Find files",
+        "Grep": "Search", "WebSearch": "Web search", "WebFetch": "Web fetch",
+        "Agent": "Subagent", "TaskCreate": "Task create", "TaskUpdate": "Task update",
+    }
+    if tool_name in labels:
+        return labels[tool_name]
+    if tool_name.startswith("mcp__plugin_telegram_telegram__"):
+        return "Telegram " + tool_name.split("__")[-1].replace("_", " ")
+    if tool_name.startswith("mcp__claude_ai_Gmail__"):
+        return "Gmail " + tool_name.split("__")[-1].replace("_", " ")
+    if tool_name.startswith("mcp__"):
+        parts = tool_name.split("__")
+        if len(parts) >= 3:
+            return parts[1].replace("_", " ").title() + " \u00b7 " + parts[2].replace("_", " ")
+    return tool_name
+
+
+def _tool_icon(tool_name):
+    """Return an emoji icon for a tool."""
+    if tool_name == "Bash":                return "\u26a1"
+    if tool_name in ("Edit", "MultiEdit"): return "\u270f\ufe0f"
+    if tool_name == "Write":               return "\U0001f4dd"
+    if tool_name == "Read":                return "\U0001f4d6"
+    if tool_name in ("Glob", "Grep"):      return "\U0001f50d"
+    if tool_name in ("WebSearch", "WebFetch"): return "\U0001f310"
+    if tool_name == "Agent":               return "\U0001f916"
+    if "telegram" in tool_name.lower():    return "\U0001f4ac"
+    if "gmail" in tool_name.lower():       return "\U0001f4e7"
+    if "calendar" in tool_name.lower():    return "\U0001f4c5"
+    if "task" in tool_name.lower():        return "\u2705"
+    return "\u2699\ufe0f"
+
+
+_AGENT_DISPLAY = {"lovelace": "Ada", "athena": "Athena", "anthony": "Anthony"}
+
+DISCORD_INBOXES = [
+    os.path.expanduser("~/Work/agents/athena/config/discord/incoming.jsonl"),
+    os.path.expanduser("~/Work/agents/lovelace/config/discord/incoming.jsonl"),
+]
+
+
+def _detect_agent_message(tool_name, tool_input):
+    """Detect send-to-agent.sh / brief-agent.sh patterns in Bash commands.
+    Returns {to, summary} dict or None."""
+    if tool_name != "Bash":
+        return None
+    cmd = (tool_input.get("command", "") if isinstance(tool_input, dict) else "").strip()
+    if not cmd:
+        return None
+    import re
+    # send-to-agent.sh <target> "<message>"
+    m = re.search(r'send-to-agent\.sh\s+(\w+)\s+["\'](.+?)["\']', cmd, re.DOTALL)
+    if m:
+        return {"to": m.group(1), "summary": m.group(2)[:120]}
+    # brief-agent.sh <target> <file>
+    m = re.search(r'brief-agent\.sh\s+(\w+)\s+(\S+)', cmd)
+    if m:
+        fname = m.group(2).split("/")[-1]
+        return {"to": m.group(1), "summary": f"Brief: {fname}"}
+    return None
+
+
+def collect_activity_data(config=None, limit=300, max_age_hours=72):
+    """Parse JSONL files and return a reverse-chronological feed of agent actions."""
+    if config is None:
+        config = {}
+    cutoff = datetime.now().astimezone() - timedelta(hours=max_age_hours)
+    events = []
+    pattern = os.path.join(PROJECTS_DIR, "**", "*.jsonl")
+
+    for filepath in glob.glob(pattern, recursive=True):
+        agent = detect_agent(filepath)
+        if agent == "default" or not _agent_visible(agent, config):
+            continue
+        try:
+            mtime = datetime.fromtimestamp(os.path.getmtime(filepath)).astimezone()
+            if mtime < cutoff:
+                continue
+        except OSError:
+            continue
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        data = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    ts_str = data.get("timestamp")
+                    if not ts_str:
+                        continue
+                    ts = parse_timestamp(ts_str)
+                    if ts and ts < cutoff:
+                        continue
+                    msg = data.get("message")
+                    if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                        continue
+                    content = msg.get("content")
+                    ts_epoch = ts.timestamp() if ts else 0
+
+                    if isinstance(content, str):
+                        if content.strip():
+                            events.append({
+                                "ts": ts_str, "ts_epoch": ts_epoch,
+                                "agent": agent, "type": "message",
+                                "tool": None, "action": "Message",
+                                "icon": "\U0001f4ac",
+                                "summary": content[:120].strip(),
+                            })
+                        continue
+
+                    if not isinstance(content, list):
+                        continue
+
+                    for block in content:
+                        if not isinstance(block, dict):
+                            continue
+                        btype = block.get("type")
+                        if btype == "tool_use":
+                            tool_name = block.get("name", "unknown")
+                            tool_input = block.get("input") or {}
+                            agent_msg = _detect_agent_message(tool_name, tool_input)
+                            if agent_msg:
+                                from_name = _AGENT_DISPLAY.get(agent, agent.title())
+                                to_name   = _AGENT_DISPLAY.get(agent_msg["to"], agent_msg["to"].title())
+                                events.append({
+                                    "ts": ts_str, "ts_epoch": ts_epoch,
+                                    "agent": agent, "type": "agent_msg",
+                                    "tool": "Bash",
+                                    "action": f"{from_name} \u2192 {to_name}",
+                                    "icon": "\U0001f4e8",
+                                    "summary": agent_msg["summary"],
+                                })
+                            else:
+                                events.append({
+                                    "ts": ts_str, "ts_epoch": ts_epoch,
+                                    "agent": agent, "type": "tool",
+                                    "tool": tool_name,
+                                    "action": _action_label(tool_name),
+                                    "icon": _tool_icon(tool_name),
+                                    "summary": _summarize_tool_call(tool_name, tool_input),
+                                })
+                        elif btype == "text":
+                            text = block.get("text", "").strip()
+                            if text:
+                                events.append({
+                                    "ts": ts_str, "ts_epoch": ts_epoch,
+                                    "agent": agent, "type": "message",
+                                    "tool": None, "action": "Message",
+                                    "icon": "\U0001f4ac",
+                                    "summary": text[:120],
+                                })
+        except (IOError, OSError):
+            continue
+
+    # Merge Discord incoming messages
+    for inbox_path in DISCORD_INBOXES:
+        if not os.path.exists(inbox_path):
+            continue
+        try:
+            with open(inbox_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        d = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    ts_str = d.get("timestamp", "")
+                    ts = parse_timestamp(ts_str)
+                    if ts and ts < cutoff:
+                        continue
+                    ts_epoch = ts.timestamp() if ts else 0
+                    author  = d.get("author", "unknown")
+                    content = d.get("content", "")
+                    if not content:
+                        continue
+                    events.append({
+                        "ts": ts_str, "ts_epoch": ts_epoch,
+                        "agent": author, "type": "discord",
+                        "tool": None, "action": "Discord",
+                        "icon": "\U0001f3ae",
+                        "summary": content[:120],
+                    })
+        except (IOError, OSError):
+            continue
+
+    events.sort(key=lambda e: e["ts_epoch"], reverse=True)
+    return events[:limit]
 
 
 # ---------------------------------------------------------------------------
@@ -702,6 +956,7 @@ def compute_dashboard_data(sessions, config=None):
         "agent_health": collect_agent_health(config=config),
         "all_agents": build_all_agents(config),
         "config_file": CONFIG_FILE,
+        "activity": collect_activity_data(config=config),
     }
 
 
@@ -1388,6 +1643,156 @@ _HTML_TEMPLATE = '''<!DOCTYPE html>
         .stat-value { font-size: 1.5rem; }
         .health-grid { grid-template-columns: 1fr 1fr; }
     }
+
+    /* Main navigation tabs */
+    .main-nav {
+        display: flex;
+        gap: 2px;
+        background: var(--bg-card);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        padding: 4px;
+        margin-bottom: 28px;
+        width: fit-content;
+    }
+    .main-nav-btn {
+        background: none;
+        border: none;
+        color: var(--text-secondary);
+        font-size: 0.8rem;
+        font-weight: 600;
+        padding: 7px 22px;
+        border-radius: 7px;
+        cursor: pointer;
+        transition: background 0.15s, color 0.15s;
+        font-family: inherit;
+        letter-spacing: 0.01em;
+    }
+    .main-nav-btn.active {
+        background: var(--bg-primary);
+        color: var(--text-primary);
+        box-shadow: 0 1px 5px rgba(0,0,0,0.3);
+    }
+    .main-nav-btn:hover:not(.active) { color: var(--text-primary); }
+
+    /* Activity tab */
+    .activity-toolbar {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        margin-bottom: 20px;
+        flex-wrap: wrap;
+    }
+    .act-filter-select {
+        background: var(--bg-card);
+        border: 1px solid var(--border);
+        border-radius: 7px;
+        color: var(--text-primary);
+        font-family: inherit;
+        font-size: 0.75rem;
+        padding: 5px 10px;
+        outline: none;
+        cursor: pointer;
+        transition: border-color 0.15s;
+        appearance: none;
+    }
+    .act-filter-select:focus { border-color: var(--accent); }
+    .act-filter-select option { background: var(--bg-card); }
+    .act-count {
+        font-size: 0.7rem;
+        color: var(--text-dim);
+        margin-left: auto;
+    }
+    .act-refresh-btn {
+        background: none;
+        border: 1px solid var(--border);
+        color: var(--text-secondary);
+        border-radius: 6px;
+        padding: 4px 9px;
+        font-size: 0.75rem;
+        cursor: pointer;
+        transition: border-color 0.15s, color 0.15s;
+    }
+    .act-refresh-btn:hover { border-color: var(--accent); color: var(--accent); }
+    .activity-card {
+        background: var(--bg-card);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 20px 24px;
+    }
+    .activity-feed { display: flex; flex-direction: column; }
+    .act-item {
+        display: flex;
+        align-items: flex-start;
+        gap: 12px;
+        padding: 10px 8px;
+        border-bottom: 1px solid var(--border-subtle);
+        border-radius: 6px;
+        transition: background 0.12s;
+    }
+    .act-item:last-child { border-bottom: none; }
+    .act-item:hover { background: var(--bg-card-hover); }
+    .act-item.act-new { animation: act-slide-in 0.35s ease; }
+    @keyframes act-slide-in {
+        from { opacity: 0; transform: translateY(-8px); }
+        to   { opacity: 1; transform: translateY(0); }
+    }
+    .act-icon-wrap {
+        width: 32px; height: 32px;
+        border-radius: 8px;
+        background: var(--bg-panel);
+        border: 1px solid var(--border);
+        display: flex; align-items: center; justify-content: center;
+        font-size: 0.88rem;
+        flex-shrink: 0;
+        margin-top: 1px;
+    }
+    .act-body { flex: 1; min-width: 0; }
+    .act-meta {
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        margin-bottom: 3px;
+        flex-wrap: wrap;
+    }
+    .act-agent-name {
+        font-size: 0.78rem;
+        font-weight: 700;
+        color: var(--text-primary);
+    }
+    .act-dot { color: var(--text-dim); font-size: 0.6rem; }
+    .act-time {
+        font-size: 0.68rem;
+        color: var(--text-secondary);
+        font-family: 'SF Mono', 'Fira Code', monospace;
+        white-space: nowrap;
+    }
+    .act-label {
+        font-size: 0.68rem;
+        font-weight: 700;
+        padding: 1px 6px;
+        border-radius: 4px;
+        font-family: 'SF Mono', 'Fira Code', monospace;
+        white-space: nowrap;
+    }
+    .act-label.t-tool      { background: rgba(108,155,255,0.1);  color: var(--accent); }
+    .act-label.t-message   { background: rgba(126,232,160,0.1);  color: #7ee8a0; }
+    .act-label.t-agent_msg { background: rgba(255,184,108,0.12); color: #ffb86c; }
+    .act-label.t-discord   { background: rgba(114,137,218,0.15); color: #7289da; }
+    .act-summary {
+        font-size: 0.76rem;
+        color: var(--text-secondary);
+        font-family: 'SF Mono', 'Fira Code', monospace;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+    .act-empty {
+        text-align: center;
+        padding: 56px 0;
+        color: var(--text-dim);
+        font-size: 0.82rem;
+    }
 </style>
 <script>(function(){const p=new URLSearchParams(location.search);const t=p.get('theme');if(t==='light'||t==='dark')document.documentElement.setAttribute('data-theme',t);})()</script>
 </head>
@@ -1446,6 +1851,15 @@ _HTML_TEMPLATE = '''<!DOCTYPE html>
             <div class="settings-config-path">{{ configFile }}</div>
         </div>
     </div>
+
+    <!-- Main nav -->
+    <div class="main-nav">
+        <button class="main-nav-btn" :class="{ active: mainTab === 'tokens' }" @click="mainTab = 'tokens'">Tokens</button>
+        <button class="main-nav-btn" :class="{ active: mainTab === 'activity' }" @click="mainTab = 'activity'">Activity</button>
+    </div>
+
+    <!-- ── Tokens view ── -->
+    <div v-show="mainTab === 'tokens'">
 
     <div class="stats-grid">
         <div class="stat-card">
@@ -1561,12 +1975,12 @@ _HTML_TEMPLATE = '''<!DOCTYPE html>
             </div>
             <div v-if="lineMaxY === 0" class="line-empty">No activity in the last 5 hours</div>
             <div v-else class="line-chart-wrap">
-                <svg viewBox="0 0 1000 168" width="100%" height="168"
+                <svg viewBox="0 0 1050 168" width="100%" height="168"
                      style="display:block; overflow:visible; cursor:crosshair;"
                      @mousemove="onLineHover($event)"
                      @mouseleave="onLineLeave()">
                     <line v-for="n in 4" :key="n"
-                          x1="0" :y1="10 + (n / 4) * 120" x2="1000" :y2="10 + (n / 4) * 120"
+                          x1="50" :y1="10 + (n / 4) * 120" x2="1050" :y2="10 + (n / 4) * 120"
                           stroke="#1e1e2e" stroke-width="0.8" />
                     <polygon v-for="s in linePaths" :key="s.key + '_fill'"
                              :points="s.fillPoints" :fill="s.color + '14'" />
@@ -1584,6 +1998,15 @@ _HTML_TEMPLATE = '''<!DOCTYPE html>
                     <text v-for="lbl in lineXLabels" :key="lbl.x"
                           :x="lbl.x" y="164" fill="#3a3a4a" font-size="16"
                           :text-anchor="lbl.anchor" font-family="'SF Mono','Fira Code',monospace">{{ lbl.text }}</text>
+                    <!-- Y-axis: max and midpoint labels -->
+                    <text v-if="lineMaxY > 0"
+                          x="2" y="9" fill="#6e6e82" font-size="14"
+                          text-anchor="start" font-family="'SF Mono','Fira Code',monospace"
+                          opacity="0.75">{{ fmtCtx(lineMaxY) }}</text>
+                    <text v-if="lineMaxY > 0"
+                          x="2" y="73" fill="#3a3a4a" font-size="14"
+                          text-anchor="start" font-family="'SF Mono','Fira Code',monospace"
+                          opacity="0.75">{{ fmtCtx(Math.round(lineMaxY / 2)) }}</text>
                 </svg>
                 <div class="line-tooltip" :style="tooltipStyle" v-if="hoverIdx !== null">
                     <div class="tt-time">{{ hoverBucket && hoverBucket.ts }}</div>
@@ -1697,6 +2120,47 @@ _HTML_TEMPLATE = '''<!DOCTYPE html>
         </div>
     </div>
 
+    </div><!-- /tokens view -->
+
+    <!-- ── Activity view ── -->
+    <div v-show="mainTab === 'activity'">
+        <div class="activity-card">
+            <div class="activity-toolbar">
+                <select class="act-filter-select" v-model="actFilter.agent">
+                    <option value="">All agents</option>
+                    <option v-for="a in actAgents" :key="a" :value="a">{{ displayName(a) }}</option>
+                </select>
+                <select class="act-filter-select" v-model="actFilter.type">
+                    <option value="">All types</option>
+                    <option value="tool">Tool calls</option>
+                    <option value="message">Messages</option>
+                    <option value="agent_msg">Agent messages</option>
+                    <option value="discord">Discord</option>
+                </select>
+                <button class="act-refresh-btn" @click="refreshActivity" :disabled="actRefreshing"
+                        v-if="serveMode">{{ actRefreshing ? '\u2026' : '\u21bb Refresh' }}</button>
+                <div class="act-count">{{ filteredActivity.length }} events</div>
+            </div>
+            <div class="activity-feed" v-if="filteredActivity.length">
+                <div v-for="(ev, idx) in filteredActivity" :key="ev.ts + ev.agent + ev.tool + idx"
+                     class="act-item" :class="{ 'act-new': actNewSet.has(ev.ts + ev.agent + ev.tool) }">
+                    <div class="act-icon-wrap">{{ ev.icon }}</div>
+                    <div class="act-body">
+                        <div class="act-meta">
+                            <span class="act-agent-name" :style="{ color: agentColor(ev.agent) }">{{ displayName(ev.agent) }}</span>
+                            <span class="act-dot">\u2022</span>
+                            <span class="act-time">{{ fmtAgo(ev.ts_epoch) }}</span>
+                            <span class="act-dot">\u2022</span>
+                            <span class="act-label" :class="'t-' + ev.type">{{ ev.action }}</span>
+                        </div>
+                        <div class="act-summary" v-if="ev.summary" :title="ev.summary">{{ ev.summary }}</div>
+                    </div>
+                </div>
+            </div>
+            <div class="act-empty" v-else>No activity in the last 72 hours matching your filters.</div>
+        </div>
+    </div><!-- /activity view -->
+
 </div>
 
 <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
@@ -1709,12 +2173,16 @@ Vue.createApp({
             ...(__INITIAL_DATA__),
             serveMode: SERVE_MODE,
             refreshing: false,
+            mainTab: 'tokens',
             lineTab: 'model',
             hoverIdx: null,
             healthNow: Date.now(),
             settingsOpen: false,
             agentDraft: [],
             darkMode: true,
+            actFilter: { agent: '', type: '' },
+            actRefreshing: false,
+            actNewSet: new Set(),
         };
     },
 
@@ -1734,7 +2202,7 @@ Vue.createApp({
 
         linePaths() {
             if (!this.line || !this.line.buckets || this.lineMaxY === 0) return [];
-            const W = 1000, PLOT_H = 120, PAD_TOP = 10;
+            const W = 1000, PLOT_H = 120, PAD_TOP = 10, X_OFF = 50;
             const buckets = this.line.buckets;
             const n = buckets.length;
             const maxY = this.lineMaxY;
@@ -1749,7 +2217,7 @@ Vue.createApp({
                 const coords = buckets.map((b, i) => {
                     const src = tab === 'model' ? b.by_model : b.by_agent;
                     const v = src[s.key] || 0;
-                    const x = n > 1 ? (i / (n - 1)) * W : W / 2;
+                    const x = (n > 1 ? (i / (n - 1)) * W : W / 2) + X_OFF;
                     const y = PAD_TOP + PLOT_H * (1 - v / maxY);
                     return [+x.toFixed(1), +y.toFixed(1)];
                 });
@@ -1765,11 +2233,11 @@ Vue.createApp({
             if (!this.line || !this.line.buckets) return [];
             const buckets = this.line.buckets;
             const n = buckets.length;
-            const W = 1000;
+            const W = 1000, X_OFF = 50;
             const step = 6; // one label per 30 min (6 × 5min)
             const labels = [];
             for (let i = 0; i < n; i += step) {
-                const x = n > 1 ? (i / (n - 1)) * W : W / 2;
+                const x = (n > 1 ? (i / (n - 1)) * W : W / 2) + X_OFF;
                 const anchor = i === 0 ? 'start' : (i + step >= n ? 'end' : 'middle');
                 labels.push({ x: x.toFixed(1), text: buckets[i].ts, anchor });
             }
@@ -1779,7 +2247,7 @@ Vue.createApp({
         hoverVBX() {
             if (this.hoverIdx === null || !this.line) return 0;
             const n = this.line.buckets.length;
-            return n > 1 ? (this.hoverIdx / (n - 1)) * 1000 : 500;
+            return n > 1 ? 50 + (this.hoverIdx / (n - 1)) * 1000 : 550;
         },
 
         hoverBucket() {
@@ -1801,7 +2269,7 @@ Vue.createApp({
         tooltipStyle() {
             if (this.hoverIdx === null || !this.line) return { display: 'none' };
             const n = this.line.buckets.length;
-            const xPct = n > 1 ? (this.hoverIdx / (n - 1)) * 100 : 50;
+            const xPct = n > 1 ? (50 + (this.hoverIdx / (n - 1)) * 1000) / 1050 * 100 : 50;
             const flip = this.hoverIdx > n * 0.65;
             return {
                 display: 'block',
@@ -1811,6 +2279,20 @@ Vue.createApp({
                     ? { right: (100 - xPct).toFixed(1) + '%', left: 'auto', transform: 'translateX(50%)' }
                     : { left: xPct.toFixed(1) + '%', right: 'auto', transform: 'translateX(-50%)' }),
             };
+        },
+
+        filteredActivity() {
+            const feed = this.activity || [];
+            return feed.filter(ev => {
+                if (this.actFilter.agent && ev.agent !== this.actFilter.agent) return false;
+                if (this.actFilter.type  && ev.type  !== this.actFilter.type)  return false;
+                return true;
+            });
+        },
+
+        actAgents() {
+            const feed = this.activity || [];
+            return [...new Set(feed.map(e => e.agent))].sort();
         },
     },
 
@@ -1859,7 +2341,10 @@ Vue.createApp({
             const relX = (event.clientX - rect.left) / rect.width;
             const n = this.line && this.line.buckets ? this.line.buckets.length : 0;
             if (n === 0) return;
-            this.hoverIdx = Math.max(0, Math.min(n - 1, Math.round(relX * (n - 1))));
+            // SVG is 1050 wide; plot area starts at x=50, width=1000
+            const svgX = relX * 1050;
+            const plotFrac = Math.max(0, Math.min(1, (svgX - 50) / 1000));
+            this.hoverIdx = Math.max(0, Math.min(n - 1, Math.round(plotFrac * (n - 1))));
         },
         onLineLeave() {
             this.hoverIdx = null;
@@ -1952,6 +2437,31 @@ Vue.createApp({
                 this.refreshing = false;
             }
         },
+        async refreshActivity() {
+            if (this.actRefreshing) return;
+            this.actRefreshing = true;
+            try {
+                const res = await fetch('/api/activity');
+                if (res.ok) {
+                    const data = await res.json();
+                    // Find new events (not yet in current feed)
+                    const existing = new Set((this.activity || []).map(e => e.ts + e.agent + e.tool));
+                    const newKeys = new Set();
+                    for (const ev of (data.events || [])) {
+                        const key = ev.ts + ev.agent + ev.tool;
+                        if (!existing.has(key)) newKeys.add(key);
+                    }
+                    this.activity = data.events || [];
+                    this.actNewSet = newKeys;
+                    // Clear new highlights after animation
+                    setTimeout(() => { this.actNewSet = new Set(); }, 1200);
+                }
+            } catch (e) {
+                console.warn('Activity poll failed:', e);
+            } finally {
+                this.actRefreshing = false;
+            }
+        },
     },
 
     mounted() {
@@ -1962,6 +2472,7 @@ Vue.createApp({
         setInterval(() => { this.healthNow = Date.now(); }, 1000);
         if (SERVE_MODE) {
             setInterval(this.refreshHealth, 5 * 1000);
+            setInterval(this.refreshActivity, 8 * 1000);
             setInterval(this.refresh, 5 * 60 * 1000);
         }
     },
@@ -2012,6 +2523,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
         elif self.path == "/api/health":
             payload = json.dumps({
                 "agents": collect_agent_health(config=load_config()),
+                "server_time": datetime.now().timestamp(),
+            }).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            self.wfile.write(payload)
+
+        elif self.path == "/api/activity":
+            config = load_config()
+            payload = json.dumps({
+                "events": collect_activity_data(config=config),
                 "server_time": datetime.now().timestamp(),
             }).encode("utf-8")
             self.send_response(200)
