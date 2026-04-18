@@ -750,6 +750,39 @@ def compute_line_data(sessions, hours=5, bucket_minutes=5, config=None):
     }
 
 
+def compute_daily_model_series(sessions, config=None):
+    """Per-calendar-day token totals by model (local timezone). Daily tab multi-line chart."""
+    if config is None:
+        config = {}
+    by_date = defaultdict(lambda: defaultdict(int))
+    for sid, s in sessions.items():
+        for entry in s.get("entries", []):
+            et = entry.get("parsed_timestamp")
+            if not et:
+                continue
+            agent = entry.get("agent", s["agent"])
+            if not _agent_visible(agent, config):
+                continue
+            model = entry.get("model", "") or "unknown"
+            day = et.astimezone().date().isoformat()
+            total = (
+                entry["input_tokens"]
+                + entry["output_tokens"]
+                + entry["cache_creation_input_tokens"]
+            )
+            by_date[day][model] += total
+    by_date_str = {d: dict(models) for d, models in sorted(by_date.items())}
+    model_totals = defaultdict(int)
+    for models in by_date_str.values():
+        for m, t in models.items():
+            model_totals[m] += t
+    models_sorted = sorted(model_totals.keys(), key=lambda m: model_totals[m], reverse=True)
+    return {
+        "by_date": by_date_str,
+        "models": models_sorted,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Dashboard data computation
 # ---------------------------------------------------------------------------
@@ -953,6 +986,7 @@ def compute_dashboard_data(sessions, config=None):
         "updated": now.strftime("%b %d, %Y at %H:%M"),
         "agent_colors": agent_colors,
         "line": compute_line_data(sessions, config=config),
+        "daily_model": compute_daily_model_series(sessions, config=config),
         "agent_health": collect_agent_health(config=config),
         "all_agents": build_all_agents(config),
         "config_file": CONFIG_FILE,
@@ -1675,6 +1709,40 @@ _HTML_TEMPLATE = '''<!DOCTYPE html>
     }
     .main-nav-btn:hover:not(.active) { color: var(--text-primary); }
 
+    /* Daily tab — week nav (matches refresh-btn / tab styling) */
+    .daily-head { flex-wrap: wrap; gap: 12px; align-items: center; }
+    .daily-head .daily-nav-controls {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+        margin-left: auto;
+    }
+    .daily-nav-btn {
+        background: none;
+        border: 1px solid var(--border);
+        color: var(--text-secondary);
+        border-radius: 6px;
+        padding: 4px 12px;
+        font-size: 0.72rem;
+        font-weight: 600;
+        cursor: pointer;
+        transition: border-color 0.15s, color 0.15s;
+        font-family: inherit;
+        letter-spacing: 0.02em;
+    }
+    .daily-nav-btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+    .daily-nav-btn:disabled { opacity: 0.35; cursor: default; }
+    .daily-week-label {
+        font-size: 0.72rem;
+        font-weight: 600;
+        color: var(--text-secondary);
+        font-family: 'SF Mono', 'Fira Code', monospace;
+        letter-spacing: 0.02em;
+        min-width: 180px;
+        text-align: center;
+    }
+
     /* Activity tab */
     .activity-toolbar {
         display: flex;
@@ -1855,6 +1923,7 @@ _HTML_TEMPLATE = '''<!DOCTYPE html>
     <!-- Main nav -->
     <div class="main-nav">
         <button class="main-nav-btn" :class="{ active: mainTab === 'tokens' }" @click="mainTab = 'tokens'">Tokens</button>
+        <button class="main-nav-btn" :class="{ active: mainTab === 'daily' }" @click="mainTab = 'daily'">Daily</button>
         <button class="main-nav-btn" :class="{ active: mainTab === 'activity' }" @click="mainTab = 'activity'">Activity</button>
     </div>
 
@@ -2122,6 +2191,70 @@ _HTML_TEMPLATE = '''<!DOCTYPE html>
 
     </div><!-- /tokens view -->
 
+    <!-- ── Daily view ── -->
+    <div v-show="mainTab === 'daily'">
+        <div class="card line-card">
+            <div class="line-card-header daily-head">
+                <div class="card-title" style="margin-bottom:0">Daily \u2014 per model</div>
+                <div class="daily-nav-controls">
+                    <button type="button" class="daily-nav-btn" @click="dailyPrevWeek">\u2190 Previous week</button>
+                    <span class="daily-week-label">{{ dailyWeekLabel }}</span>
+                    <button type="button" class="daily-nav-btn" @click="dailyNextWeek" :disabled="dailyWeekOffset >= 0">Next week \u2192</button>
+                </div>
+            </div>
+            <p style="font-size:0.68rem;color:var(--text-dim);margin:-8px 0 14px 0">Input + output + cache write tokens per day (local time). One line per model.</p>
+            <div v-if="dailyMaxY === 0" class="line-empty">No usage in this week</div>
+            <div v-else class="line-chart-wrap">
+                <svg viewBox="0 0 1050 168" width="100%" height="168"
+                     style="display:block; overflow:visible; cursor:crosshair;"
+                     @mousemove="onDailyHover($event)"
+                     @mouseleave="onDailyLeave()">
+                    <line v-for="n in 4" :key="'dg' + n"
+                          x1="50" :y1="10 + (n / 4) * 120" x2="1050" :y2="10 + (n / 4) * 120"
+                          stroke="#1e1e2e" stroke-width="0.8" />
+                    <polygon v-for="s in dailyLinePaths" :key="s.key + '_dfill'"
+                             :points="s.fillPoints" :fill="s.color + '14'" />
+                    <polyline v-for="s in dailyLinePaths" :key="s.key + '_dline'"
+                              :points="s.points" :stroke="s.color"
+                              fill="none" stroke-width="1.8"
+                              stroke-linejoin="round" stroke-linecap="round" />
+                    <line v-if="dailyHoverIdx !== null"
+                          :x1="hoverDailyVBX" y1="10" :x2="hoverDailyVBX" y2="130"
+                          stroke="rgba(255,255,255,0.12)" stroke-width="1" stroke-dasharray="3,4" />
+                    <circle v-if="dailyHoverIdx !== null"
+                            v-for="s in dailyLinePaths" :key="s.key + '_ddot'"
+                            :cx="hoverDailyVBX" :cy="getDailyHoverY(s.key)"
+                            r="5" :fill="s.color" stroke="#0a0a0f" stroke-width="2" />
+                    <text v-for="lbl in dailyXLabels" :key="'dl' + lbl.x"
+                          :x="lbl.x" y="164" fill="#3a3a4a" font-size="16"
+                          :text-anchor="lbl.anchor" font-family="'SF Mono','Fira Code',monospace">{{ lbl.text }}</text>
+                    <text v-if="dailyMaxY > 0"
+                          x="2" y="9" fill="#6e6e82" font-size="14"
+                          text-anchor="start" font-family="'SF Mono','Fira Code',monospace"
+                          opacity="0.75">{{ fmtCtx(dailyMaxY) }}</text>
+                    <text v-if="dailyMaxY > 0"
+                          x="2" y="73" fill="#3a3a4a" font-size="14"
+                          text-anchor="start" font-family="'SF Mono','Fira Code',monospace"
+                          opacity="0.75">{{ fmtCtx(Math.round(dailyMaxY / 2)) }}</text>
+                </svg>
+                <div class="line-tooltip" :style="tooltipStyleDaily" v-if="dailyHoverIdx !== null">
+                    <div class="tt-time">{{ dailyHoverDayTitle }}</div>
+                    <div v-for="v in dailyHoverValues" :key="v.label" class="tt-row">
+                        <span class="tt-dot" :style="{ background: v.color }"></span>
+                        <span class="tt-label">{{ v.label }}</span>
+                        <span class="tt-value">{{ fmt(v.value) }}</span>
+                    </div>
+                </div>
+                <div class="line-legend">
+                    <div v-for="s in dailyLinePaths" :key="s.key + '_dleg'" class="legend-item">
+                        <span class="legend-dot" :style="{ background: s.color }"></span>
+                        <span class="legend-label">{{ s.label }}</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div><!-- /daily view -->
+
     <!-- ── Activity view ── -->
     <div v-show="mainTab === 'activity'">
         <div class="activity-card">
@@ -2183,6 +2316,8 @@ Vue.createApp({
             actFilter: { agent: '', type: '' },
             actRefreshing: false,
             actNewSet: new Set(),
+            dailyWeekOffset: 0,
+            dailyHoverIdx: null,
         };
     },
 
@@ -2281,6 +2416,153 @@ Vue.createApp({
             };
         },
 
+        dailyWeekMonday() {
+            const m = this.mondayLocal(new Date());
+            m.setDate(m.getDate() + this.dailyWeekOffset * 7);
+            return m;
+        },
+        dailyWeekDates() {
+            const m = new Date(this.dailyWeekMonday);
+            const out = [];
+            for (let i = 0; i < 7; i++) {
+                const d = new Date(m);
+                d.setDate(m.getDate() + i);
+                out.push(this.localISODate(d));
+            }
+            return out;
+        },
+        dailyWeekLabel() {
+            const dates = this.dailyWeekDates;
+            if (!dates.length) return '';
+            const fmt = (iso) => {
+                const [y, mo, da] = iso.split('-').map(Number);
+                const dt = new Date(y, mo - 1, da);
+                return dt.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+            };
+            const y = dates[0].slice(0, 4);
+            return fmt(dates[0]) + ' \u2013 ' + fmt(dates[6]) + ', ' + y;
+        },
+        dailySeriesModelsInWeek() {
+            const dm = this.daily_model;
+            if (!dm || !dm.by_date) return [];
+            const byDate = dm.by_date;
+            const active = new Set();
+            for (const day of this.dailyWeekDates) {
+                const row = byDate[day];
+                if (!row) continue;
+                for (const [k, v] of Object.entries(row)) {
+                    if (v > 0) active.add(k);
+                }
+            }
+            const order = dm.models || [];
+            const out = [];
+            const seen = new Set();
+            for (const m of order) {
+                if (active.has(m)) {
+                    out.push(m);
+                    seen.add(m);
+                }
+            }
+            for (const m of active) {
+                if (!seen.has(m)) out.push(m);
+            }
+            return out;
+        },
+        dailyMaxY() {
+            const dm = this.daily_model;
+            if (!dm || !dm.by_date) return 0;
+            const byDate = dm.by_date;
+            let max = 0;
+            for (const day of this.dailyWeekDates) {
+                const row = byDate[day];
+                if (!row) continue;
+                for (const m of this.dailySeriesModelsInWeek) {
+                    const v = row[m] || 0;
+                    if (v > max) max = v;
+                }
+            }
+            return max;
+        },
+        dailyLinePaths() {
+            if (!this.daily_model || this.dailyMaxY === 0) return [];
+            const W = 1000, PLOT_H = 120, PAD_TOP = 10, X_OFF = 50;
+            const dates = this.dailyWeekDates;
+            const n = dates.length;
+            const maxY = this.dailyMaxY;
+            const byDate = this.daily_model.by_date || {};
+            const bottomY = PAD_TOP + PLOT_H;
+            const series = this.dailySeriesModelsInWeek.map((m) => ({
+                key: m,
+                label: this.modelShort(m),
+                color: this.modelColor(m),
+            }));
+            return series.map((s) => {
+                const coords = dates.map((day, i) => {
+                    const v = (byDate[day] && byDate[day][s.key]) || 0;
+                    const x = (n > 1 ? (i / (n - 1)) * W : W / 2) + X_OFF;
+                    const y = PAD_TOP + PLOT_H * (1 - v / maxY);
+                    return [+x.toFixed(1), +y.toFixed(1)];
+                });
+                const points = coords.map((c) => c.join(',')).join(' ');
+                const fillPoints = coords[0][0] + ',' + bottomY + ' '
+                    + points + ' '
+                    + coords[coords.length - 1][0] + ',' + bottomY;
+                return { ...s, points, fillPoints };
+            });
+        },
+        dailyXLabels() {
+            const dates = this.dailyWeekDates;
+            if (!dates.length) return [];
+            const W = 1000, X_OFF = 50;
+            const n = dates.length;
+            return dates.map((iso, i) => {
+                const [y, mo, da] = iso.split('-').map(Number);
+                const dt = new Date(y, mo - 1, da);
+                const wk = dt.toLocaleDateString(undefined, { weekday: 'short' });
+                const dayNum = dt.getDate();
+                const x = (n > 1 ? (i / (n - 1)) * W : W / 2) + X_OFF;
+                const anchor = i === 0 ? 'start' : (i === n - 1 ? 'end' : 'middle');
+                return { x: x.toFixed(1), text: wk + ' ' + dayNum, anchor };
+            });
+        },
+        hoverDailyVBX() {
+            if (this.dailyHoverIdx === null) return 0;
+            const n = 7;
+            return n > 1 ? 50 + (this.dailyHoverIdx / (n - 1)) * 1000 : 550;
+        },
+        dailyHoverDayTitle() {
+            if (this.dailyHoverIdx === null) return '';
+            const iso = this.dailyWeekDates[this.dailyHoverIdx];
+            if (!iso) return '';
+            const [y, mo, da] = iso.split('-').map(Number);
+            const dt = new Date(y, mo - 1, da);
+            return dt.toLocaleDateString(undefined, { weekday: 'long', month: 'short', day: 'numeric', year: 'numeric' });
+        },
+        dailyHoverValues() {
+            if (this.dailyHoverIdx === null || !this.daily_model) return [];
+            const day = this.dailyWeekDates[this.dailyHoverIdx];
+            const row = (this.daily_model.by_date && this.daily_model.by_date[day]) || {};
+            return this.dailyLinePaths.map((s) => ({
+                label: s.label,
+                color: s.color,
+                value: row[s.key] || 0,
+            }));
+        },
+        tooltipStyleDaily() {
+            if (this.dailyHoverIdx === null) return { display: 'none' };
+            const n = 7;
+            const xPct = n > 1 ? (50 + (this.dailyHoverIdx / (n - 1)) * 1000) / 1050 * 100 : 50;
+            const flip = this.dailyHoverIdx > n * 0.65;
+            return {
+                display: 'block',
+                position: 'absolute',
+                bottom: 'calc(100% - 10px)',
+                ...(flip
+                    ? { right: (100 - xPct).toFixed(1) + '%', left: 'auto', transform: 'translateX(50%)' }
+                    : { left: xPct.toFixed(1) + '%', right: 'auto', transform: 'translateX(-50%)' }),
+            };
+        },
+
         filteredActivity() {
             const feed = this.activity || [];
             return feed.filter(ev => {
@@ -2348,6 +2630,48 @@ Vue.createApp({
         },
         onLineLeave() {
             this.hoverIdx = null;
+        },
+        localISODate(d) {
+            const y = d.getFullYear();
+            const mo = String(d.getMonth() + 1).padStart(2, '0');
+            const day = String(d.getDate()).padStart(2, '0');
+            return y + '-' + mo + '-' + day;
+        },
+        mondayLocal(d) {
+            const x = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+            const day = x.getDay();
+            const diff = day === 0 ? -6 : 1 - day;
+            x.setDate(x.getDate() + diff);
+            return x;
+        },
+        dailyPrevWeek() {
+            this.dailyHoverIdx = null;
+            this.dailyWeekOffset--;
+        },
+        dailyNextWeek() {
+            this.dailyHoverIdx = null;
+            if (this.dailyWeekOffset < 0) this.dailyWeekOffset++;
+        },
+        getDailyHoverY(key) {
+            if (this.dailyHoverIdx === null || !this.daily_model) return 0;
+            const PLOT_H = 120, PAD_TOP = 10;
+            const day = this.dailyWeekDates[this.dailyHoverIdx];
+            const row = (this.daily_model.by_date && this.daily_model.by_date[day]) || {};
+            const v = row[key] || 0;
+            const maxY = this.dailyMaxY || 1;
+            return PAD_TOP + PLOT_H * (1 - v / maxY);
+        },
+        onDailyHover(event) {
+            const svg = event.currentTarget;
+            const rect = svg.getBoundingClientRect();
+            const relX = (event.clientX - rect.left) / rect.width;
+            const n = 7;
+            const svgX = relX * 1050;
+            const plotFrac = Math.max(0, Math.min(1, (svgX - 50) / 1000));
+            this.dailyHoverIdx = Math.max(0, Math.min(n - 1, Math.round(plotFrac * (n - 1))));
+        },
+        onDailyLeave() {
+            this.dailyHoverIdx = null;
         },
         displayName(raw) {
             if (!this.all_agents) return raw;
