@@ -783,6 +783,38 @@ def compute_daily_model_series(sessions, config=None):
     }
 
 
+def compute_daily_agent_series(sessions, config=None):
+    """Per-calendar-day token totals by agent (local timezone). Daily tab multi-line chart."""
+    if config is None:
+        config = {}
+    by_date = defaultdict(lambda: defaultdict(int))
+    for sid, s in sessions.items():
+        for entry in s.get("entries", []):
+            et = entry.get("parsed_timestamp")
+            if not et:
+                continue
+            agent = entry.get("agent", s["agent"])
+            if not _agent_visible(agent, config):
+                continue
+            day = et.astimezone().date().isoformat()
+            total = (
+                entry["input_tokens"]
+                + entry["output_tokens"]
+                + entry["cache_creation_input_tokens"]
+            )
+            by_date[day][agent] += total
+    by_date_str = {d: dict(agents) for d, agents in sorted(by_date.items())}
+    agent_totals = defaultdict(int)
+    for agents in by_date_str.values():
+        for a, t in agents.items():
+            agent_totals[a] += t
+    agents_sorted = sorted(agent_totals.keys(), key=lambda a: agent_totals[a], reverse=True)
+    return {
+        "by_date": by_date_str,
+        "agents": agents_sorted,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Dashboard data computation
 # ---------------------------------------------------------------------------
@@ -987,6 +1019,7 @@ def compute_dashboard_data(sessions, config=None):
         "agent_colors": agent_colors,
         "line": compute_line_data(sessions, config=config),
         "daily_model": compute_daily_model_series(sessions, config=config),
+        "daily_agent": compute_daily_agent_series(sessions, config=config),
         "agent_health": collect_agent_health(config=config),
         "all_agents": build_all_agents(config),
         "config_file": CONFIG_FILE,
@@ -1037,6 +1070,27 @@ _HTML_TEMPLATE = '''<!DOCTYPE html>
         --tab-active-bg: #d1d1d6;
         --shadow-hover: 0 8px 28px rgba(0, 0, 0, 0.12);
     }
+    [data-theme="light"] .health-status.active {
+        background: rgba(34, 160, 80, 0.1); color: #15803d;
+        border: 1px solid rgba(34, 160, 80, 0.25);
+    }
+    [data-theme="light"] .health-status.active .health-status-dot { background: #16a34a; }
+    [data-theme="light"] .health-status.idle {
+        background: rgba(217, 119, 6, 0.1); color: #b45309;
+        border: 1px solid rgba(217, 119, 6, 0.25);
+    }
+    [data-theme="light"] .health-status.idle .health-status-dot { background: #d97706; }
+    [data-theme="light"] .health-status.offline {
+        background: rgba(0, 0, 0, 0.05); color: #8e8e93;
+        border: 1px solid #d1d1d6;
+    }
+    [data-theme="light"] .health-status.offline .health-status-dot { background: #8e8e93; }
+    [data-theme="light"] .health-agent { background: #f9f9fb; }
+    [data-theme="light"] .badge { opacity: 0.9; }
+    [data-theme="light"] .cost-cell { color: #15803d; }
+    [data-theme="light"] .kpi-val { color: #15803d; }
+    [data-theme="light"] tr.today { background: rgba(74, 122, 237, 0.05); }
+    [data-theme="light"] tr.today:hover { background: rgba(74, 122, 237, 0.1); }
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
         font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', system-ui, sans-serif;
@@ -2195,14 +2249,18 @@ _HTML_TEMPLATE = '''<!DOCTYPE html>
     <div v-show="mainTab === 'daily'">
         <div class="card line-card">
             <div class="line-card-header daily-head">
-                <div class="card-title" style="margin-bottom:0">Daily \u2014 per model</div>
+                <div class="card-title" style="margin-bottom:0">Daily \u2014 {{ dailyGroupBy === 'model' ? 'per model' : 'per agent' }}</div>
                 <div class="daily-nav-controls">
+                    <div class="tab-bar" style="margin-right:8px">
+                        <button class="tab-btn" :class="{ active: dailyGroupBy === 'model' }" @click="dailyGroupBy = 'model'; dailyHoverIdx = null">Model</button>
+                        <button class="tab-btn" :class="{ active: dailyGroupBy === 'agent' }" @click="dailyGroupBy = 'agent'; dailyHoverIdx = null">Agent</button>
+                    </div>
                     <button type="button" class="daily-nav-btn" @click="dailyPrevWeek">\u2190 Previous week</button>
                     <span class="daily-week-label">{{ dailyWeekLabel }}</span>
                     <button type="button" class="daily-nav-btn" @click="dailyNextWeek" :disabled="dailyWeekOffset >= 0">Next week \u2192</button>
                 </div>
             </div>
-            <p style="font-size:0.68rem;color:var(--text-dim);margin:-8px 0 14px 0">Input + output + cache write tokens per day (local time). One line per model.</p>
+            <p style="font-size:0.68rem;color:var(--text-dim);margin:-8px 0 14px 0">Input + output + cache write tokens per day (local time). One line per {{ dailyGroupBy }}.</p>
             <div v-if="dailyMaxY === 0" class="line-empty">No usage in this week</div>
             <div v-else class="line-chart-wrap">
                 <svg viewBox="0 0 1050 168" width="100%" height="168"
@@ -2318,6 +2376,7 @@ Vue.createApp({
             actNewSet: new Set(),
             dailyWeekOffset: 0,
             dailyHoverIdx: null,
+            dailyGroupBy: 'model',
         };
     },
 
@@ -2442,8 +2501,11 @@ Vue.createApp({
             const y = dates[0].slice(0, 4);
             return fmt(dates[0]) + ' \u2013 ' + fmt(dates[6]) + ', ' + y;
         },
-        dailySeriesModelsInWeek() {
-            const dm = this.daily_model;
+        dailyActiveData() {
+            return this.dailyGroupBy === 'model' ? this.daily_model : this.daily_agent;
+        },
+        dailySeriesKeys() {
+            const dm = this.dailyActiveData;
             if (!dm || !dm.by_date) return [];
             const byDate = dm.by_date;
             const active = new Set();
@@ -2454,47 +2516,45 @@ Vue.createApp({
                     if (v > 0) active.add(k);
                 }
             }
-            const order = dm.models || [];
+            const order = (this.dailyGroupBy === 'model' ? dm.models : dm.agents) || [];
             const out = [];
             const seen = new Set();
-            for (const m of order) {
-                if (active.has(m)) {
-                    out.push(m);
-                    seen.add(m);
-                }
+            for (const k of order) {
+                if (active.has(k)) { out.push(k); seen.add(k); }
             }
-            for (const m of active) {
-                if (!seen.has(m)) out.push(m);
+            for (const k of active) {
+                if (!seen.has(k)) out.push(k);
             }
             return out;
         },
         dailyMaxY() {
-            const dm = this.daily_model;
+            const dm = this.dailyActiveData;
             if (!dm || !dm.by_date) return 0;
             const byDate = dm.by_date;
             let max = 0;
             for (const day of this.dailyWeekDates) {
                 const row = byDate[day];
                 if (!row) continue;
-                for (const m of this.dailySeriesModelsInWeek) {
-                    const v = row[m] || 0;
+                for (const k of this.dailySeriesKeys) {
+                    const v = row[k] || 0;
                     if (v > max) max = v;
                 }
             }
             return max;
         },
         dailyLinePaths() {
-            if (!this.daily_model || this.dailyMaxY === 0) return [];
+            if (!this.dailyActiveData || this.dailyMaxY === 0) return [];
             const W = 1000, PLOT_H = 120, PAD_TOP = 10, X_OFF = 50;
             const dates = this.dailyWeekDates;
             const n = dates.length;
             const maxY = this.dailyMaxY;
-            const byDate = this.daily_model.by_date || {};
+            const byDate = this.dailyActiveData.by_date || {};
             const bottomY = PAD_TOP + PLOT_H;
-            const series = this.dailySeriesModelsInWeek.map((m) => ({
-                key: m,
-                label: this.modelShort(m),
-                color: this.modelColor(m),
+            const isModel = this.dailyGroupBy === 'model';
+            const series = this.dailySeriesKeys.map((k) => ({
+                key: k,
+                label: isModel ? this.modelShort(k) : this.displayName(k),
+                color: isModel ? this.modelColor(k) : this.agentColor(k),
             }));
             return series.map((s) => {
                 const coords = dates.map((day, i) => {
@@ -2539,9 +2599,9 @@ Vue.createApp({
             return dt.toLocaleDateString(undefined, { weekday: 'long', month: 'short', day: 'numeric', year: 'numeric' });
         },
         dailyHoverValues() {
-            if (this.dailyHoverIdx === null || !this.daily_model) return [];
+            if (this.dailyHoverIdx === null || !this.dailyActiveData) return [];
             const day = this.dailyWeekDates[this.dailyHoverIdx];
-            const row = (this.daily_model.by_date && this.daily_model.by_date[day]) || {};
+            const row = (this.dailyActiveData.by_date && this.dailyActiveData.by_date[day]) || {};
             return this.dailyLinePaths.map((s) => ({
                 label: s.label,
                 color: s.color,
@@ -2653,10 +2713,10 @@ Vue.createApp({
             if (this.dailyWeekOffset < 0) this.dailyWeekOffset++;
         },
         getDailyHoverY(key) {
-            if (this.dailyHoverIdx === null || !this.daily_model) return 0;
+            if (this.dailyHoverIdx === null || !this.dailyActiveData) return 0;
             const PLOT_H = 120, PAD_TOP = 10;
             const day = this.dailyWeekDates[this.dailyHoverIdx];
-            const row = (this.daily_model.by_date && this.daily_model.by_date[day]) || {};
+            const row = (this.dailyActiveData.by_date && this.dailyActiveData.by_date[day]) || {};
             const v = row[key] || 0;
             const maxY = this.dailyMaxY || 1;
             return PAD_TOP + PLOT_H * (1 - v / maxY);
